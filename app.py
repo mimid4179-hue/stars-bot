@@ -4,7 +4,7 @@ import datetime
 import os
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -15,6 +15,10 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
 DEAL_TIMEOUT_MINUTES = 15
+
+# ВПИШИ СВОИ ДАННЫЕ ТУТ:
+MY_USERNAME = "@твой_юзернейм"
+REVIEWS_CHANNEL = "https://t.me/твой_канал_с_отзывами"
 # ===============================
 
 bot = Bot(token=BOT_TOKEN)
@@ -71,13 +75,52 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
             await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} закрыта по таймауту.")
         except: pass
 
+# --- КОМАНДЫ ---
+
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
+    text = (
+        f"👋 Приветствую, {message.from_user.first_name}!\n\n"
+        f"Этот бот по автоматической покупке Telegram Stars.\n\n"
+        f"💵 <b>Наш курс:</b>\n"
+        f"От 50 до 99 звёзд — 0.8 грн за звезду\n"
+        f"От 100 звёзд — 0.75 грн за звезду\n\n"
+        f"👤 Мой профиль: {MY_USERNAME}\n"
+        f"🌟 Канал с отзывами: {REVIEWS_CHANNEL}\n\n"
+        f"Для покупки нажми /buy"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")]
+        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")],
+        [InlineKeyboardButton(text="📝 Оценить бота", url=REVIEWS_CHANNEL)]
     ])
-    await message.answer("Нажми кнопку, чтобы создать сделку по покупке звёзд (мин. 50).", reply_markup=kb)
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.message(Command("buy"))
+async def cmd_buy(message: types.Message, state: FSMContext):
+    await message.answer("Введи количество звёзд (минимум 50):")
+    await state.set_state(DealForm.waiting_stars)
+
+@dp.message(Command("review"))
+async def cmd_review(message: types.Message):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оставить отзыв", url=REVIEWS_CHANNEL)]
+    ])
+    await message.answer("Будем очень благодарны за ваш отзыв! Нажмите кнопку ниже:", reply_markup=kb)
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message):
+    text = (
+        "🚨 <b>Жалоба / Поддержка</b>\n\n"
+        "Если бот не работает, звёзды не пришли или долго нет ответа, "
+        "пожалуйста, напишите нам напрямую. Мы рассмотрим вашу жалобу в течение 1 часа."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Написать в поддержку", url=f"https://t.me/{MY_USERNAME.replace('@', '')}")]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+# --- ЛОГИКА СДЕЛОК ---
 
 @dp.callback_query(F.data == "new_deal")
 async def new_deal(callback: types.CallbackQuery, state: FSMContext):
@@ -214,7 +257,6 @@ async def handle(request):
     return web.Response(text="Bot is running!")
 
 async def main():
-    # Запускаем мини-веб-сервер для Render
     app = web.Application()
     app.router.add_get('/', handle)
     runner = web.AppRunner(app)
