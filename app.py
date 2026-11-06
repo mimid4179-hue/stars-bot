@@ -11,7 +11,7 @@ from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -24,7 +24,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 MY_USERNAME = "@frosyyy"
 REVIEWS_CHANNEL = "https://t.me/otzfrosy"
 
-# Список подарков (цена в звездах)
+# Список подарков
 GIFTS = {
     "heart": {"name": "❤️ Сердце", "stars": 15},
     "bear": {"name": "🧸 Мишка", "stars": 15},
@@ -47,7 +47,9 @@ conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cursor = conn.cursor(cursor_factory=DictCursor)
 
-# Таблица сделок (добавлены поля deal_type и gift_items)
+# Добавляем колонку is_anonymous, если её еще нет
+cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
@@ -55,6 +57,7 @@ CREATE TABLE IF NOT EXISTS deals (
     buyer_username TEXT,
     deal_type TEXT DEFAULT 'balance',
     gift_items TEXT,
+    is_anonymous BOOLEAN DEFAULT FALSE,
     stars_amount INTEGER,
     recipient_username TEXT,
     price_uah REAL,
@@ -98,6 +101,7 @@ dp.callback_query.middleware(BanMiddleware())
 class DealForm(StatesGroup):
     choosing_type = State()
     choosing_gifts = State()
+    choosing_anonymity = State()
     waiting_stars = State()
     waiting_recipient = State()
     waiting_receipt = State()
@@ -148,8 +152,8 @@ async def start(message: types.Message, state: FSMContext):
 
     text = (
         f"Здравствуйте!\n\n"
-        f"Это бот для покупки звезд за гривны.\n"
-        f"✅ Звезды приходят моментально, сразу на баланс, всё абсолютно безопасно.\n\n"
+        f"Тут вы можете купить моментальные звёзды на баланс либо подарком.\n"
+        f"✅ Звезды приходят моментально, всё абсолютно безопасно.\n\n"
         f"💵 <b>Курс:</b>\n"
         f"50-99 звезд — 0.8 грн\n"
         f"от 100 — 0.75 грн\n\n"
@@ -260,8 +264,14 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
             return
         total_stars = sum(GIFTS[k]['stars'] for k in selected)
         await state.update_data(stars=total_stars)
-        await callback.message.answer("Введи @username получателя подарков:")
-        await state.set_state(DealForm.waiting_recipient)
+        
+        # Спрашиваем про анонимность
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🕵️‍♂️ Да, отправить анонимно", callback_data="anon_yes")],
+            [InlineKeyboardButton(text="👤 Нет, от моего имени", callback_data="anon_no")]
+        ])
+        await callback.message.answer("Хотите ли вы отправить подарок анонимно?", reply_markup=kb)
+        await state.set_state(DealForm.choosing_anonymity)
         await callback.answer()
         return
     else:
@@ -278,6 +288,16 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
     await show_gift_menu(callback.message, state)
     await callback.answer()
 
+@dp.callback_query(F.data.startswith("anon_"))
+async def handle_anonymity(callback: types.CallbackQuery, state: FSMContext):
+    is_anon = callback.data == "anon_yes"
+    await state.update_data(is_anonymous=is_anon)
+    
+    text = "🕵️‍♂️ Выбрана анонимная отправка." if is_anon else "👤 Подарок будет отправлен от вашего имени."
+    await callback.message.answer(f"{text}\n\nВведи @username получателя подарков:")
+    await state.set_state(DealForm.waiting_recipient)
+    await callback.answer()
+
 @dp.message(DealForm.waiting_stars)
 async def process_stars(message: types.Message, state: FSMContext):
     try:
@@ -285,7 +305,7 @@ async def process_stars(message: types.Message, state: FSMContext):
         if stars < 50:
             await message.answer("Минимум 50. Попробуй ещё:")
             return
-        await state.update_data(stars=stars)
+        await state.update_data(stars=stars, is_anonymous=False)
         await message.answer("Введи свой @username, на который зачислить звёзды:")
         await state.set_state(DealForm.waiting_recipient)
     except ValueError:
@@ -298,6 +318,7 @@ async def process_recipient(message: types.Message, state: FSMContext):
     stars = data['stars']
     deal_type = data.get('deal_type', 'balance')
     selected_gifts = data.get('selected_gifts', [])
+    is_anonymous = data.get('is_anonymous', False)
     
     gift_items_str = json.dumps(selected_gifts, ensure_ascii=False) if deal_type == 'gift' else None
     
@@ -310,15 +331,16 @@ async def process_recipient(message: types.Message, state: FSMContext):
         deal_id = random.randint(10000, 99999)
 
     cursor.execute("""
-        INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
-    """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, stars, recipient, price, now.isoformat(), expires.isoformat()))
+        INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, is_anonymous, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
+    """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat()))
 
     type_text = "🎁 Подарком" if deal_type == 'gift' else "⭐ На баланс"
     gift_text = ""
     if deal_type == 'gift':
         gift_names = [GIFTS[k]['name'] for k in selected_gifts]
-        gift_text = f"\nПодарки: {', '.join(gift_names)}"
+        anon_text = " (Анонимно 🕵️‍♂️)" if is_anonymous else ""
+        gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
     await message.answer(
         f"✅ Сделка #{deal_id} создана.\n"
@@ -363,7 +385,8 @@ async def admin_accept(callback: types.CallbackQuery):
     if deal['deal_type'] == 'gift' and deal['gift_items']:
         selected = json.loads(deal['gift_items'])
         gift_names = [GIFTS[k]['name'] for k in selected]
-        gift_text = f"\nПодарки: {', '.join(gift_names)}"
+        anon_text = " (Анонимно 🕵️‍♂️)" if deal['is_anonymous'] else ""
+        gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
@@ -427,7 +450,8 @@ async def process_receipt(message: types.Message, state: FSMContext):
     if deal['deal_type'] == 'gift' and deal['gift_items']:
         selected = json.loads(deal['gift_items'])
         gift_names = [GIFTS[k]['name'] for k in selected]
-        gift_text = f"\nПодарки: {', '.join(gift_names)}"
+        anon_text = " (Анонимно 🕵️‍♂️)" if deal['is_anonymous'] else ""
+        gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
     await bot.send_photo(ADMIN_ID, photo=file_id,
         caption=f"💰 Чек по сделке #{deal_id}\n"
@@ -466,7 +490,6 @@ async def admin_send_screenshot(message: types.Message, state: FSMContext):
                 await message.answer("❌ Не удалось отправить скриншот (возможно, пользователь заблокировал бота).")
         await state.clear()
         return
-    # Если это не скриншот для сделки, ничего не делаем (пропускаем дальше)
 
 @dp.callback_query(F.data.startswith("complete_"))
 async def admin_complete(callback: types.CallbackQuery):
