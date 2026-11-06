@@ -28,7 +28,7 @@ dp = Dispatcher()
 conn = sqlite3.connect("deals.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблица для сделок (теперь ID случайный, а не по порядку)
+# Таблица для сделок (добавлено поле awaiting_review для отзывов)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS deals (
     status TEXT DEFAULT 'pending',
     created_at TEXT,
     expires_at TEXT,
-    receipt_file_id TEXT
+    receipt_file_id TEXT,
+    awaiting_review INTEGER DEFAULT 0
 )
 """)
 cursor.execute("""
@@ -111,6 +112,12 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
+    
+    # ЗАЩИТА ОТ ПОКУПКИ У САМОГО СЕБЯ
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Вы не можете купить звёзды у самого себя.")
+        return
+
     text = (
         f"Здравствуйте!\n\n"
         f"Это бот для покупки звезд.\n\n"
@@ -129,11 +136,16 @@ async def start(message: types.Message, state: FSMContext):
 
 @dp.message(Command("buy"))
 async def cmd_buy(message: types.Message, state: FSMContext):
+    if message.from_user.id == ADMIN_ID:
+        await message.answer("Вы не можете купить звёзды у самого себя.")
+        return
     await message.answer("Введи количество звёзд (минимум 50):")
     await state.set_state(DealForm.waiting_stars)
 
 @dp.message(Command("review"))
 async def cmd_review(message: types.Message):
+    if message.from_user.id == ADMIN_ID: return
+    
     cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
     result = cursor.fetchone()
     count = result[0]
@@ -169,6 +181,10 @@ async def process_rating(callback: types.CallbackQuery):
     review_id = cursor.lastrowid
     conn.commit()
     
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except: pass
+
     await callback.answer("Спасибо за ваш отзыв! ⭐", show_alert=True)
     
     user_info = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
@@ -224,13 +240,15 @@ async def ban_user(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "show_reviews")
 async def show_reviews(callback: types.CallbackQuery):
+    if callback.from_user.id == ADMIN_ID: return
     await cmd_review(callback.message)
     await callback.answer()
 
-# --- ЛОГИКА СДЕЛОК ---
-
 @dp.callback_query(F.data == "new_deal")
 async def new_deal(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id == ADMIN_ID:
+        await callback.answer("Вы не можете купить звёзды у самого себя.", show_alert=True)
+        return
     await callback.message.answer("Введи количество звёзд (минимум 50):")
     await state.set_state(DealForm.waiting_stars)
     await callback.answer()
@@ -257,14 +275,13 @@ async def process_recipient(message: types.Message, state: FSMContext):
     now = datetime.datetime.now()
     expires = now + datetime.timedelta(minutes=DEAL_TIMEOUT_MINUTES)
     
-    # Генерируем случайный 5-значный ID сделки
     deal_id = random.randint(10000, 99999)
-    while get_deal(deal_id): # Проверка, чтобы не было совпадений
+    while get_deal(deal_id):
         deal_id = random.randint(10000, 99999)
 
     cursor.execute("""
-        INSERT INTO deals (id, buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+        INSERT INTO deals (id, buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)
     """, (deal_id, message.from_user.id, message.from_user.username or "нет", stars, recipient, price, now.isoformat(), expires.isoformat()))
     conn.commit()
 
@@ -292,7 +309,7 @@ async def admin_accept(callback: types.CallbackQuery):
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
     if not deal or deal[6] != 'pending':
-        await callback.answer("Сделка неактивна (возможно, база данных сервера обновилась)", show_alert=True); return
+        await callback.answer("Сделка неактивна", show_alert=True); return
 
     update_deal_status(deal_id, 'accepted')
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -360,10 +377,57 @@ async def admin_complete(callback: types.CallbackQuery):
     if not deal or deal[6] != 'paid':
         await callback.answer("Сделка не в статусе 'оплачено'", show_alert=True); return
 
-    update_deal_status(deal_id, 'completed')
-    await bot.send_message(deal[1], f"🎉 Сделка #{deal_id} завершена! Звёзды отправлены на @{deal[4]}.")
+    # Меняем статус на завершено и ставим флаг, что ждем отзыв
+    cursor.execute("UPDATE deals SET status = 'completed', awaiting_review = 1 WHERE id = ?", (deal_id,))
+    conn.commit()
+
+    # Сообщение клиенту с просьбой написать отзыв текстом
+    await bot.send_message(
+        deal[1], 
+        f"🎉 Сделка #{deal_id} завершена! Звёзды успешно отправлены на @{deal[4]}.\n\n"
+        f"Пожалуйста, оставьте отзыв об этой сделке (например: {MY_USERNAME} не скам).\n"
+        f"Просто напишите ваш отзыв следующим сообщением сюда:", 
+    )
+    
     await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
     await callback.answer()
+
+# ЛОВИМ ТЕКСТОВЫЙ ОТЗЫВ ПОСЛЕ ЗАВЕРШЕНИЯ СДЕЛКИ
+@dp.message(F.text)
+async def handle_text_review(message: types.Message):
+    # Пропускаем команды
+    if message.text.startswith('/'): return
+    
+    # Ищем последнюю сделку этого юзера, которая ждет отзыв
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = ? AND awaiting_review = 1 ORDER BY id DESC LIMIT 1", (message.from_user.id,))
+    deal = cursor.fetchone()
+    
+    if deal:
+        deal_id = deal[0]
+        user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+        
+        # Отправляем тебе текст отзыва
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
+        ])
+        try:
+            await bot.send_message(
+                ADMIN_ID, 
+                f"📝 <b>Новый отзыв к сделке #{deal_id}</b>\n\n"
+                f"От: {user_info}\n"
+                f"Текст отзыва: {message.text}", 
+                reply_markup=admin_kb,
+                parse_mode="HTML"
+            )
+        except: pass
+
+        # Убираем флаг ожидания
+        cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = ?", (deal_id,))
+        conn.commit()
+        
+        await message.answer("Спасибо за ваш отзыв! ❤️")
+        return
+
 
 async def handle(request):
     return web.Response(text="Bot is running!")
