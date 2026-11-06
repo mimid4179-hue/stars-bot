@@ -1,0 +1,229 @@
+import asyncio
+import sqlite3
+import datetime
+import os
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+# ========== НАСТРОЙКИ ==========
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
+CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
+CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
+DEAL_TIMEOUT_MINUTES = 15
+# ===============================
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+conn = sqlite3.connect("deals.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS deals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buyer_id INTEGER,
+    buyer_username TEXT,
+    stars_amount INTEGER,
+    recipient_username TEXT,
+    price_uah REAL,
+    status TEXT DEFAULT 'pending',
+    created_at TEXT,
+    expires_at TEXT,
+    receipt_file_id TEXT
+)
+""")
+conn.commit()
+
+class DealForm(StatesGroup):
+    waiting_stars = State()
+    waiting_recipient = State()
+    waiting_receipt = State()
+
+def calculate_price(stars: int) -> float:
+    if stars < 100:
+        return stars * 0.8
+    return stars * 0.75
+
+def get_deal(deal_id: int):
+    cursor.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
+    return cursor.fetchone()
+
+def update_deal_status(deal_id: int, status: str, receipt_file_id: str = None):
+    if receipt_file_id:
+        cursor.execute("UPDATE deals SET status = ?, receipt_file_id = ? WHERE id = ?", (status, receipt_file_id, deal_id))
+    else:
+        cursor.execute("UPDATE deals SET status = ? WHERE id = ?", (status, deal_id))
+    conn.commit()
+
+async def close_expired_deal(deal_id: int, buyer_id: int):
+    await asyncio.sleep(DEAL_TIMEOUT_MINUTES * 60)
+    deal = get_deal(deal_id)
+    if deal and deal[6] == 'pending':
+        update_deal_status(deal_id, 'expired')
+        try:
+            await bot.send_message(buyer_id, f"❌ Сделка #{deal_id} закрыта: истекло {DEAL_TIMEOUT_MINUTES} мин.")
+        except: pass
+        try:
+            await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} закрыта по таймауту.")
+        except: pass
+
+@dp.message(CommandStart())
+async def start(message: types.Message, state: FSMContext):
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")]
+    ])
+    await message.answer("Нажми кнопку, чтобы создать сделку по покупке звёзд (мин. 50).", reply_markup=kb)
+
+@dp.callback_query(F.data == "new_deal")
+async def new_deal(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи количество звёзд (минимум 50):")
+    await state.set_state(DealForm.waiting_stars)
+    await callback.answer()
+
+@dp.message(DealForm.waiting_stars)
+async def process_stars(message: types.Message, state: FSMContext):
+    try:
+        stars = int(message.text)
+        if stars < 50:
+            await message.answer("Минимум 50. Попробуй ещё:")
+            return
+        await state.update_data(stars=stars)
+        await message.answer("Введи свой @username, на который зачислить звёзды:")
+        await state.set_state(DealForm.waiting_recipient)
+    except ValueError:
+        await message.answer("Введи число:")
+
+@dp.message(DealForm.waiting_recipient)
+async def process_recipient(message: types.Message, state: FSMContext):
+    recipient = message.text.strip().replace("@", "")
+    data = await state.get_data()
+    stars = data['stars']
+    price = calculate_price(stars)
+    now = datetime.datetime.now()
+    expires = now + datetime.timedelta(minutes=DEAL_TIMEOUT_MINUTES)
+    cursor.execute("""
+        INSERT INTO deals (buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+    """, (message.from_user.id, message.from_user.username or "нет", stars, recipient, price, now.isoformat(), expires.isoformat()))
+    conn.commit()
+    deal_id = cursor.lastrowid
+
+    await message.answer(
+        f"✅ Сделка #{deal_id} создана.\nЗвёзд: {stars}\nК оплате: {price:.2f} грн\n"
+        f"Получатель: @{recipient}\n\nЖди подтверждения от админа. Время: {DEAL_TIMEOUT_MINUTES} мин."
+    )
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{deal_id}"),
+         InlineKeyboardButton(text="❌ Отказаться", callback_data=f"decline_{deal_id}")]
+    ])
+    await bot.send_message(ADMIN_ID,
+        f"🔔 Новая сделка #{deal_id}\nПокупатель: @{message.from_user.username or message.from_user.id}\n"
+        f"Звёзд: {stars}\nЦена: {price:.2f} грн\nПолучатель: @{recipient}",
+        reply_markup=admin_kb
+    )
+    asyncio.create_task(close_expired_deal(deal_id, message.from_user.id))
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("accept_"))
+async def admin_accept(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True); return
+    deal_id = int(callback.data.split("_")[1])
+    deal = get_deal(deal_id)
+    if not deal or deal[6] != 'pending':
+        await callback.answer("Сделка неактивна", show_alert=True); return
+
+    update_deal_status(deal_id, 'accepted')
+    buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")]
+    ])
+    await bot.send_message(deal[1],
+        f"✅ Сделка #{deal_id} принята!\nПереведи {deal[5]:.2f} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\nПосле оплаты нажми кнопку и прикрепи скриншот.",
+        reply_markup=buyer_kb, parse_mode="Markdown"
+    )
+    await callback.message.edit_text(callback.message.text + "\n\n✅ Ты принял сделку.")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("decline_"))
+async def admin_decline(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True); return
+    deal_id = int(callback.data.split("_")[1])
+    deal = get_deal(deal_id)
+    if not deal or deal[6] != 'pending':
+        await callback.answer("Сделка неактивна", show_alert=True); return
+
+    update_deal_status(deal_id, 'declined')
+    await bot.send_message(deal[1], f"❌ Сделка #{deal_id} отклонена. Попробуй позже.")
+    await callback.message.edit_text(callback.message.text + "\n\n❌ Ты отклонил сделку.")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("paid_"))
+async def buyer_paid(callback: types.CallbackQuery, state: FSMContext):
+    deal_id = int(callback.data.split("_")[1])
+    deal = get_deal(deal_id)
+    if not deal or deal[6] != 'accepted':
+        await callback.answer("Сделка не ждёт оплаты", show_alert=True); return
+    await state.update_data(deal_id=deal_id)
+    await callback.message.answer("Отправь скриншот или фото чека:")
+    await state.set_state(DealForm.waiting_receipt)
+    await callback.answer()
+
+@dp.message(DealForm.waiting_receipt, F.photo)
+async def process_receipt(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    deal_id = data.get('deal_id')
+    if not deal_id:
+        await message.answer("Ошибка."); await state.clear(); return
+
+    file_id = message.photo[-1].file_id
+    update_deal_status(deal_id, 'paid', file_id)
+    deal = get_deal(deal_id)
+    await message.answer(f"✅ Чек по сделке #{deal_id} получен. Жди выдачи звёзд.")
+
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")]
+    ])
+    await bot.send_photo(ADMIN_ID, photo=file_id,
+        caption=f"💰 Чек по сделке #{deal_id}\nЗвёзд: {deal[3]}\nПолучатель: @{deal[4]}\nСумма: {deal[5]:.2f} грн\n\nПроверь оплату и отправь звёзды через Fragment.",
+        reply_markup=admin_kb
+    )
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("complete_"))
+async def admin_complete(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("Нет доступа", show_alert=True); return
+    deal_id = int(callback.data.split("_")[1])
+    deal = get_deal(deal_id)
+    if not deal or deal[6] != 'paid':
+        await callback.answer("Сделка не в статусе 'оплачено'", show_alert=True); return
+
+    update_deal_status(deal_id, 'completed')
+    await bot.send_message(deal[1], f"🎉 Сделка #{deal_id} завершена! Звёзды отправлены на @{deal[4]}.")
+    await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
+    await callback.answer()
+
+async def handle(request):
+    return web.Response(text="Bot is running!")
+
+async def main():
+    # Запускаем мини-веб-сервер для Render
+    app = web.Application()
+    app.router.add_get('/', handle)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', int(os.environ.get("PORT", 8080)))
+    await site.start()
+    
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
