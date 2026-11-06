@@ -1,5 +1,6 @@
 import asyncio
-import sqlite3
+import psycopg2
+from psycopg2.extras import DictCursor
 import datetime
 import os
 import random
@@ -17,6 +18,7 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
 DEAL_TIMEOUT_MINUTES = 15
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
 MY_USERNAME = "@frosyyy"
 REVIEWS_CHANNEL = "https://t.me/otzfrosy"
@@ -25,14 +27,14 @@ REVIEWS_CHANNEL = "https://t.me/otzfrosy"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-conn = sqlite3.connect("deals.db", check_same_thread=False)
-cursor = conn.cursor()
+conn = psycopg2.connect(DATABASE_URL)
+conn.autocommit = True
+cursor = conn.cursor(cursor_factory=DictCursor)
 
-# Таблица для сделок (добавлено поле awaiting_review для отзывов)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
-    buyer_id INTEGER,
+    buyer_id BIGINT,
     buyer_username TEXT,
     stars_amount INTEGER,
     recipient_username TEXT,
@@ -46,17 +48,16 @@ CREATE TABLE IF NOT EXISTS deals (
 """)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reviews (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER,
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT UNIQUE,
     rating INTEGER
 )
 """)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS banned_users (
-    user_id INTEGER PRIMARY KEY
+    user_id BIGINT PRIMARY KEY
 )
 """)
-conn.commit()
 
 class BanMiddleware(BaseMiddleware):
     async def __call__(
@@ -67,7 +68,7 @@ class BanMiddleware(BaseMiddleware):
     ) -> Any:
         user = getattr(event, 'from_user', None)
         if user and user.id != ADMIN_ID:
-            cursor.execute("SELECT * FROM banned_users WHERE user_id = ?", (user.id,))
+            cursor.execute("SELECT * FROM banned_users WHERE user_id = %s", (user.id,))
             if cursor.fetchone():
                 return
         return await handler(event, data)
@@ -87,20 +88,19 @@ def calculate_price(stars: int) -> float:
     return stars * 0.75
 
 def get_deal(deal_id: int):
-    cursor.execute("SELECT * FROM deals WHERE id = ?", (deal_id,))
+    cursor.execute("SELECT * FROM deals WHERE id = %s", (deal_id,))
     return cursor.fetchone()
 
 def update_deal_status(deal_id: int, status: str, receipt_file_id: str = None):
     if receipt_file_id:
-        cursor.execute("UPDATE deals SET status = ?, receipt_file_id = ? WHERE id = ?", (status, receipt_file_id, deal_id))
+        cursor.execute("UPDATE deals SET status = %s, receipt_file_id = %s WHERE id = %s", (status, receipt_file_id, deal_id))
     else:
-        cursor.execute("UPDATE deals SET status = ? WHERE id = ?", (status, deal_id))
-    conn.commit()
+        cursor.execute("UPDATE deals SET status = %s WHERE id = %s", (status, deal_id))
 
 async def close_expired_deal(deal_id: int, buyer_id: int):
     await asyncio.sleep(DEAL_TIMEOUT_MINUTES * 60)
     deal = get_deal(deal_id)
-    if deal and deal[6] == 'pending':
+    if deal and deal['status'] == 'pending':
         update_deal_status(deal_id, 'expired')
         try:
             await bot.send_message(buyer_id, f"❌ Сделка #{deal_id} закрыта: истекло {DEAL_TIMEOUT_MINUTES} мин.")
@@ -112,8 +112,6 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
-    
-    # ЗАЩИТА ОТ ПОКУПКИ У САМОГО СЕБЯ
     if message.from_user.id == ADMIN_ID:
         await message.answer("Вы не можете купить звёзды у самого себя.")
         return
@@ -148,8 +146,8 @@ async def cmd_review(message: types.Message):
     
     cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
     result = cursor.fetchone()
-    count = result[0]
-    avg_rating = round(result[1], 1) if result[1] else 0.0
+    count = result['count']
+    avg_rating = round(result['avg'], 1) if result['avg'] else 0.0
 
     text = f"Пожалуйста, оставьте отзыв о нашей работе в канале!\n\n"
     text += f"📊 <b>Средняя оценка:</b> {avg_rating} ⭐ (Всего оценок: {count})\n\n"
@@ -172,14 +170,13 @@ async def process_rating(callback: types.CallbackQuery):
     rating = int(callback.data.split("_")[1])
     user_id = callback.from_user.id
     
-    cursor.execute("SELECT * FROM reviews WHERE user_id = ?", (user_id,))
+    cursor.execute("SELECT * FROM reviews WHERE user_id = %s", (user_id,))
     if cursor.fetchone():
         await callback.answer("Вы уже оставляли оценку!", show_alert=True)
         return
 
-    cursor.execute("INSERT INTO reviews (user_id, rating) VALUES (?, ?)", (user_id, rating))
-    review_id = cursor.lastrowid
-    conn.commit()
+    cursor.execute("INSERT INTO reviews (user_id, rating) VALUES (%s, %s) RETURNING id", (user_id, rating))
+    review_id = cursor.fetchone()['id']
     
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -221,8 +218,7 @@ async def process_report(message: types.Message, state: FSMContext):
 async def delete_review(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
     review_id = int(callback.data.split("_")[1])
-    cursor.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
-    conn.commit()
+    cursor.execute("DELETE FROM reviews WHERE id = %s", (review_id,))
     await callback.message.edit_text(callback.message.text + "\n\n🗑 <b>Оценка удалена.</b>", parse_mode="HTML")
     await callback.answer()
 
@@ -230,8 +226,7 @@ async def delete_review(callback: types.CallbackQuery):
 async def ban_user(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
     user_id = int(callback.data.split("_")[1])
-    cursor.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
+    cursor.execute("INSERT INTO banned_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
     await callback.message.edit_text(callback.message.text + "\n\n🚫 <b>Пользователь забанен.</b>", parse_mode="HTML")
     try:
         await bot.send_message(user_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
@@ -281,9 +276,8 @@ async def process_recipient(message: types.Message, state: FSMContext):
 
     cursor.execute("""
         INSERT INTO deals (id, buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0)
+        VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
     """, (deal_id, message.from_user.id, message.from_user.username or "нет", stars, recipient, price, now.isoformat(), expires.isoformat()))
-    conn.commit()
 
     await message.answer(
         f"✅ Сделка #{deal_id} создана.\nЗвёзд: {stars}\nК оплате: {price:.2f} грн\n"
@@ -308,15 +302,15 @@ async def admin_accept(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True); return
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
-    if not deal or deal[6] != 'pending':
+    if not deal or deal['status'] != 'pending':
         await callback.answer("Сделка неактивна", show_alert=True); return
 
     update_deal_status(deal_id, 'accepted')
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")]
     ])
-    await bot.send_message(deal[1],
-        f"✅ Сделка #{deal_id} принята!\nПереведи {deal[5]:.2f} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\nПосле оплаты нажми кнопку и прикрепи скриншот.",
+    await bot.send_message(deal['buyer_id'],
+        f"✅ Сделка #{deal_id} принята!\nПереведи {deal['price_uah']:.2f} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\nПосле оплаты нажми кнопку и прикрепи скриншот.",
         reply_markup=buyer_kb, parse_mode="Markdown"
     )
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ты принял сделку.")
@@ -328,11 +322,11 @@ async def admin_decline(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True); return
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
-    if not deal or deal[6] != 'pending':
+    if not deal or deal['status'] != 'pending':
         await callback.answer("Сделка неактивна", show_alert=True); return
 
     update_deal_status(deal_id, 'declined')
-    await bot.send_message(deal[1], f"❌ Сделка #{deal_id} отклонена. Попробуй позже.")
+    await bot.send_message(deal['buyer_id'], f"❌ Сделка #{deal_id} отклонена. Попробуй позже.")
     await callback.message.edit_text(callback.message.text + "\n\n❌ Ты отклонил сделку.")
     await callback.answer()
 
@@ -340,7 +334,7 @@ async def admin_decline(callback: types.CallbackQuery):
 async def buyer_paid(callback: types.CallbackQuery, state: FSMContext):
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
-    if not deal or deal[6] != 'accepted':
+    if not deal or deal['status'] != 'accepted':
         await callback.answer("Сделка не ждёт оплаты", show_alert=True); return
     await state.update_data(deal_id=deal_id)
     await callback.message.answer("Отправь скриншот или фото чека:")
@@ -363,7 +357,7 @@ async def process_receipt(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")]
     ])
     await bot.send_photo(ADMIN_ID, photo=file_id,
-        caption=f"💰 Чек по сделке #{deal_id}\nЗвёзд: {deal[3]}\nПолучатель: @{deal[4]}\nСумма: {deal[5]:.2f} грн\n\nПроверь оплату и отправь звёзды через Fragment.",
+        caption=f"💰 Чек по сделке #{deal_id}\nЗвёзд: {deal['stars_amount']}\nПолучатель: @{deal['recipient_username']}\nСумма: {deal['price_uah']:.2f} грн\n\nПроверь оплату и отправь звёзды через Fragment.",
         reply_markup=admin_kb
     )
     await state.clear()
@@ -374,60 +368,52 @@ async def admin_complete(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True); return
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
-    if not deal or deal[6] != 'paid':
+    if not deal or deal['status'] != 'paid':
         await callback.answer("Сделка не в статусе 'оплачено'", show_alert=True); return
 
-    # Меняем статус на завершено и ставим флаг, что ждем отзыв
-    cursor.execute("UPDATE deals SET status = 'completed', awaiting_review = 1 WHERE id = ?", (deal_id,))
-    conn.commit()
+    cursor.execute("UPDATE deals SET status = 'completed', awaiting_review = 1 WHERE id = %s", (deal_id,))
 
-    # Сообщение клиенту с просьбой написать отзыв текстом
     await bot.send_message(
-        deal[1], 
-        f"🎉 Сделка #{deal_id} завершена! Звёзды успешно отправлены на @{deal[4]}.\n\n"
+        deal['buyer_id'], 
+        f"🎉 Сделка #{deal_id} завершена! Звёзды успешно отправлены на @{deal['recipient_username']}.\n\n"
         f"Пожалуйста, оставьте отзыв об этой сделке (например: {MY_USERNAME} не скам).\n"
         f"Просто напишите ваш отзыв следующим сообщением сюда:", 
     )
-    
     await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
     await callback.answer()
 
-# ЛОВИМ ТЕКСТОВЫЙ ОТЗЫВ ПОСЛЕ ЗАВЕРШЕНИЯ СДЕЛКИ
 @dp.message(F.text)
 async def handle_text_review(message: types.Message):
-    # Пропускаем команды
     if message.text.startswith('/'): return
     
-    # Ищем последнюю сделку этого юзера, которая ждет отзыв
-    cursor.execute("SELECT id FROM deals WHERE buyer_id = ? AND awaiting_review = 1 ORDER BY id DESC LIMIT 1", (message.from_user.id,))
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND awaiting_review = 1 ORDER BY id DESC LIMIT 1", (message.from_user.id,))
     deal = cursor.fetchone()
     
     if deal:
-        deal_id = deal[0]
+        deal_id = deal['id']
         user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
         
-        # Отправляем тебе текст отзыва
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
         ])
         try:
+            # ПЕРЕСЫЛАЕМ СООБЩЕНИЕ ТЕБЕ
+            forwarded_msg = await message.forward(chat_id=ADMIN_ID)
+            
+            # Отправляем уведомление к пересланному сообщению
             await bot.send_message(
                 ADMIN_ID, 
-                f"📝 <b>Новый отзыв к сделке #{deal_id}</b>\n\n"
-                f"От: {user_info}\n"
-                f"Текст отзыва: {message.text}", 
+                f"📝 <b>Отзыв к сделке #{deal_id}</b>\n"
+                f"От: {user_info}", 
+                reply_to_message_id=forwarded_msg.message_id,
                 reply_markup=admin_kb,
                 parse_mode="HTML"
             )
         except: pass
 
-        # Убираем флаг ожидания
-        cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = ?", (deal_id,))
-        conn.commit()
-        
+        cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
         await message.answer("Спасибо за ваш отзыв! ❤️")
         return
-
 
 async def handle(request):
     return web.Response(text="Bot is running!")
