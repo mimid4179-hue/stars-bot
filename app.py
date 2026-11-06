@@ -81,6 +81,8 @@ class DealForm(StatesGroup):
     waiting_recipient = State()
     waiting_receipt = State()
     waiting_report = State()
+    chat_buyer = State()
+    chat_admin = State()
 
 def calculate_price(stars: int) -> float:
     if stars < 100:
@@ -100,13 +102,14 @@ def update_deal_status(deal_id: int, status: str, receipt_file_id: str = None):
 async def close_expired_deal(deal_id: int, buyer_id: int):
     await asyncio.sleep(DEAL_TIMEOUT_MINUTES * 60)
     deal = get_deal(deal_id)
-    if deal and deal['status'] == 'pending':
+    # Если сделка висит в pending или accepted (не оплачена), отменяем
+    if deal and deal['status'] in ('pending', 'accepted'):
         update_deal_status(deal_id, 'expired')
         try:
-            await bot.send_message(buyer_id, f"❌ Сделка #{deal_id} закрыта: истекло {DEAL_TIMEOUT_MINUTES} мин.")
+            await bot.send_message(buyer_id, f"❌ Сделка #{deal_id} автоматически отменена, так как истекло время ({DEAL_TIMEOUT_MINUTES} мин).")
         except: pass
         try:
-            await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} закрыта по таймауту.")
+            await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} отменена по таймауту.")
         except: pass
 
 @dp.message(CommandStart())
@@ -114,6 +117,12 @@ async def start(message: types.Message, state: FSMContext):
     await state.clear()
     if message.from_user.id == ADMIN_ID:
         await message.answer("Вы не можете купить звёзды у самого себя.")
+        return
+
+    # Проверка на активную сделку
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND status IN ('pending', 'accepted', 'paid')", (message.from_user.id,))
+    if cursor.fetchone():
+        await message.answer("У вас уже есть активная сделка. Пожалуйста, дождитесь её завершения или отмены, прежде чем создавать новую.")
         return
 
     text = (
@@ -136,6 +145,10 @@ async def start(message: types.Message, state: FSMContext):
 async def cmd_buy(message: types.Message, state: FSMContext):
     if message.from_user.id == ADMIN_ID:
         await message.answer("Вы не можете купить звёзды у самого себя.")
+        return
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND status IN ('pending', 'accepted', 'paid')", (message.from_user.id,))
+    if cursor.fetchone():
+        await message.answer("У вас уже есть активная сделка. Пожалуйста, дождитесь её завершения.")
         return
     await message.answer("Введи количество звёзд (минимум 50):")
     await state.set_state(DealForm.waiting_stars)
@@ -200,15 +213,14 @@ async def cmd_report(message: types.Message, state: FSMContext):
 
 @dp.message(DealForm.waiting_report)
 async def process_report(message: types.Message, state: FSMContext):
-    report_text = message.text
     user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
-    
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
     ])
-    
     try:
-        await bot.send_message(ADMIN_ID, f"🚨 <b>Новая жалоба!</b>\n\nОт: {user_info}\nТекст: {report_text}", reply_markup=admin_kb, parse_mode="HTML")
+        # Пересылаем жалобу
+        await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Жалоба от</b> {user_info}", reply_markup=admin_kb, parse_mode="HTML")
     except: pass
 
     await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
@@ -244,6 +256,12 @@ async def new_deal(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id == ADMIN_ID:
         await callback.answer("Вы не можете купить звёзды у самого себя.", show_alert=True)
         return
+    
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND status IN ('pending', 'accepted', 'paid')", (callback.from_user.id,))
+    if cursor.fetchone():
+        await callback.answer("У вас уже есть активная сделка. Дождитесь её завершения.", show_alert=True)
+        return
+
     await callback.message.answer("Введи количество звёзд (минимум 50):")
     await state.set_state(DealForm.waiting_stars)
     await callback.answer()
@@ -286,7 +304,9 @@ async def process_recipient(message: types.Message, state: FSMContext):
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{deal_id}"),
-         InlineKeyboardButton(text="❌ Отказаться", callback_data=f"decline_{deal_id}")]
+         InlineKeyboardButton(text="❌ Отказаться", callback_data=f"decline_{deal_id}")],
+        [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{message.from_user.id}"),
+         InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
     ])
     await bot.send_message(ADMIN_ID,
         f"🔔 Новая сделка #{deal_id}\nПокупатель: @{message.from_user.username or message.from_user.id}\n"
@@ -307,7 +327,8 @@ async def admin_accept(callback: types.CallbackQuery):
 
     update_deal_status(deal_id, 'accepted')
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")]
+        [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
+        [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")]
     ])
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\nПереведи {deal['price_uah']:.2f} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\nПосле оплаты нажми кнопку и прикрепи скриншот.",
@@ -354,7 +375,8 @@ async def process_receipt(message: types.Message, state: FSMContext):
     await message.answer(f"✅ Чек по сделке #{deal_id} получен. Жди выдачи звёзд.")
 
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")]
+        [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")],
+        [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{deal['buyer_id']}")]
     ])
     await bot.send_photo(ADMIN_ID, photo=file_id,
         caption=f"💰 Чек по сделке #{deal_id}\nЗвёзд: {deal['stars_amount']}\nПолучатель: @{deal['recipient_username']}\nСумма: {deal['price_uah']:.2f} грн\n\nПроверь оплату и отправь звёзды через Fragment.",
@@ -382,6 +404,46 @@ async def admin_complete(callback: types.CallbackQuery):
     await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
     await callback.answer()
 
+# --- СВЯЗЬ МЕЖДУ ПОЛЬЗОВАТЕЛЕМ И АДМИНОМ ---
+
+@dp.callback_query(F.data == "contact_admin")
+async def contact_admin(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Напишите ваше сообщение для продавца. Оно будет доставлено лично в чат.")
+    await state.set_state(DealForm.chat_buyer)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("contact_"))
+async def contact_buyer(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    buyer_id = int(callback.data.split("_")[1])
+    await state.update_data(target_id=buyer_id)
+    await callback.message.answer("Напишите сообщение для покупателя. Оно будет отправлено ему в чат.")
+    await state.set_state(DealForm.chat_admin)
+    await callback.answer()
+
+@dp.message(DealForm.chat_buyer)
+async def process_chat_buyer(message: types.Message, state: FSMContext):
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+    try:
+        await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        await bot.send_message(ADMIN_ID, f"💬 Сообщение от клиента {user_info}")
+    except: pass
+    await message.answer("Сообщение отправлено продавцу.")
+    await state.clear()
+
+@dp.message(DealForm.chat_admin)
+async def process_chat_admin(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    target_id = data.get('target_id')
+    if target_id:
+        try:
+            await bot.send_message(target_id, f"💬 <b>Сообщение от продавца:</b>\n\n{message.text}", parse_mode="HTML")
+            await message.answer("Сообщение отправлено покупателю.")
+        except:
+            await message.answer("Не удалось отправить сообщение (возможно, пользователь заблокировал бота).")
+    await state.clear()
+
+# --- ЛОВИМ ТЕКСТОВЫЙ ОТЗЫВ ---
 @dp.message(F.text)
 async def handle_text_review(message: types.Message):
     if message.text.startswith('/'): return
@@ -397,19 +459,17 @@ async def handle_text_review(message: types.Message):
             [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
         ])
         try:
-            # ПЕРЕСЫЛАЕМ СООБЩЕНИЕ ТЕБЕ
-            forwarded_msg = await message.forward(chat_id=ADMIN_ID)
-            
-            # Отправляем уведомление к пересланному сообщению
+            # Пересылаем сообщение тебе (надежный метод)
+            forwarded_msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
             await bot.send_message(
                 ADMIN_ID, 
-                f"📝 <b>Отзыв к сделке #{deal_id}</b>\n"
-                f"От: {user_info}", 
+                f"📝 <b>Отзыв к сделке #{deal_id}</b>\nОт: {user_info}", 
                 reply_to_message_id=forwarded_msg.message_id,
                 reply_markup=admin_kb,
                 parse_mode="HTML"
             )
-        except: pass
+        except Exception as e:
+            print(f"Ошибка пересылки: {e}")
 
         cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
         await message.answer("Спасибо за ваш отзыв! ❤️")
