@@ -16,9 +16,9 @@ CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
 DEAL_TIMEOUT_MINUTES = 15
 
-# ВПИШИ СВОИ ДАННЫЕ ТУТ:
-MY_USERNAME = "@твой_юзернейм"
-REVIEWS_CHANNEL = "https://t.me/твой_канал_с_отзывами"
+# ТВОИ ДАННЫЕ:
+MY_USERNAME = "@frosyyy"
+REVIEWS_CHANNEL = "https://t.me/otzfrosy"
 # ===============================
 
 bot = Bot(token=BOT_TOKEN)
@@ -26,6 +26,8 @@ dp = Dispatcher()
 
 conn = sqlite3.connect("deals.db", check_same_thread=False)
 cursor = conn.cursor()
+
+# Таблица для сделок
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,12 +42,21 @@ CREATE TABLE IF NOT EXISTS deals (
     receipt_file_id TEXT
 )
 """)
+# Таблица для отзывов
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    rating INTEGER
+)
+""")
 conn.commit()
 
 class DealForm(StatesGroup):
     waiting_stars = State()
     waiting_recipient = State()
     waiting_receipt = State()
+    waiting_report = State() # Новое состояние для жалобы
 
 def calculate_price(stars: int) -> float:
     if stars < 100:
@@ -81,18 +92,18 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
     text = (
-        f"👋 Приветствую, {message.from_user.first_name}!\n\n"
-        f"Этот бот по автоматической покупке Telegram Stars.\n\n"
-        f"💵 <b>Наш курс:</b>\n"
-        f"От 50 до 99 звёзд — 0.8 грн за звезду\n"
-        f"От 100 звёзд — 0.75 грн за звезду\n\n"
+        f"Здравствуйте, {message.from_user.first_name}!\n\n"
+        f"Это бот для покупки звезд.\n\n"
+        f"💵 <b>Курс:</b>\n"
+        f"50-99 звезд — 0.8 грн\n"
+        f"от 100 — 0.75 грн\n\n"
         f"👤 Мой профиль: {MY_USERNAME}\n"
-        f"🌟 Канал с отзывами: {REVIEWS_CHANNEL}\n\n"
-        f"Для покупки нажми /buy"
+        f"🌟 Отзывы: @otzfrosy\n\n"
+        f"Если есть дополнительные вопросы, обращайтесь."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")],
-        [InlineKeyboardButton(text="📝 Оценить бота", url=REVIEWS_CHANNEL)]
+        [InlineKeyboardButton(text="📝 Оценить бота", callback_data="show_reviews")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -103,22 +114,71 @@ async def cmd_buy(message: types.Message, state: FSMContext):
 
 @dp.message(Command("review"))
 async def cmd_review(message: types.Message):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Оставить отзыв", url=REVIEWS_CHANNEL)]
-    ])
-    await message.answer("Будем очень благодарны за ваш отзыв! Нажмите кнопку ниже:", reply_markup=kb)
+    cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
+    result = cursor.fetchone()
+    count = result[0]
+    avg_rating = round(result[1], 1) if result[1] else 0.0
 
-@dp.message(Command("report"))
-async def cmd_report(message: types.Message):
-    text = (
-        "🚨 <b>Жалоба / Поддержка</b>\n\n"
-        "Если бот не работает, звёзды не пришли или долго нет ответа, "
-        "пожалуйста, напишите нам напрямую. Мы рассмотрим вашу жалобу в течение 1 часа."
-    )
+    text = f"Пожалуйста, оставьте отзыв о нашей работе в канале!\n\n"
+    text += f"📊 <b>Средняя оценка:</b> {avg_rating} ⭐ (Всего оценок: {count})\n\n"
+    text += f"Выберите оценку ниже:"
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Написать в поддержку", url=f"https://t.me/{MY_USERNAME.replace('@', '')}")]
+        [
+            InlineKeyboardButton(text="1⭐", callback_data="rate_1"),
+            InlineKeyboardButton(text="2⭐", callback_data="rate_2"),
+            InlineKeyboardButton(text="3⭐", callback_data="rate_3"),
+            InlineKeyboardButton(text="4⭐", callback_data="rate_4"),
+            InlineKeyboardButton(text="5⭐", callback_data="rate_5")
+        ],
+        [InlineKeyboardButton(text="Перейти в канал с отзывами", url=REVIEWS_CHANNEL)]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("rate_"))
+async def process_rating(callback: types.CallbackQuery):
+    rating = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    cursor.execute("SELECT * FROM reviews WHERE user_id = ?", (user_id,))
+    if cursor.fetchone():
+        await callback.answer("Вы уже оставляли оценку!", show_alert=True)
+        return
+
+    cursor.execute("INSERT INTO reviews (user_id, rating) VALUES (?, ?)", (user_id, rating))
+    conn.commit()
+    
+    # Всплывающее окно после оценки
+    await callback.answer("Спасибо за ваш отзыв! ⭐", show_alert=True)
+    
+    try:
+        await bot.send_message(ADMIN_ID, f"⭐ Новая оценка от @{callback.from_user.username or user_id}: {rating} звёзд!")
+    except: pass
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message, state: FSMContext):
+    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
+    await state.set_state(DealForm.waiting_report)
+
+# Ловим текст жалобы
+@dp.message(DealForm.waiting_report)
+async def process_report(message: types.Message, state: FSMContext):
+    report_text = message.text
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+    
+    # Пересылаем жалобу тебе
+    try:
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Новая жалоба!</b>\n\nОт: {user_info}\nТекст: {report_text}", parse_mode="HTML")
+    except: pass
+
+    # Ответ пользователю
+    await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
+    await state.clear()
+
+@dp.callback_query(F.data == "show_reviews")
+async def show_reviews(callback: types.CallbackQuery):
+    await cmd_review(callback.message)
+    await callback.answer()
 
 # --- ЛОГИКА СДЕЛОК ---
 
