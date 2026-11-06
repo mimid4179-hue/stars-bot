@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 import datetime
 import os
+import random
 from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
@@ -17,7 +18,6 @@ CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
 DEAL_TIMEOUT_MINUTES = 15
 
-# ТВОИ ДАННЫЕ:
 MY_USERNAME = "@frosyyy"
 REVIEWS_CHANNEL = "https://t.me/otzfrosy"
 # ===============================
@@ -28,10 +28,10 @@ dp = Dispatcher()
 conn = sqlite3.connect("deals.db", check_same_thread=False)
 cursor = conn.cursor()
 
-# Таблица для сделок
+# Таблица для сделок (теперь ID случайный, а не по порядку)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id INTEGER PRIMARY KEY,
     buyer_id INTEGER,
     buyer_username TEXT,
     stars_amount INTEGER,
@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS deals (
     receipt_file_id TEXT
 )
 """)
-# Таблица для отзывов
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reviews (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -51,7 +50,6 @@ CREATE TABLE IF NOT EXISTS reviews (
     rating INTEGER
 )
 """)
-# Таблица для забаненных пользователей
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS banned_users (
     user_id INTEGER PRIMARY KEY
@@ -59,7 +57,6 @@ CREATE TABLE IF NOT EXISTS banned_users (
 """)
 conn.commit()
 
-# --- МИДЛВАРЬ ДЛЯ БАНОВ (блокирует спамеров) ---
 class BanMiddleware(BaseMiddleware):
     async def __call__(
         self,
@@ -71,7 +68,7 @@ class BanMiddleware(BaseMiddleware):
         if user and user.id != ADMIN_ID:
             cursor.execute("SELECT * FROM banned_users WHERE user_id = ?", (user.id,))
             if cursor.fetchone():
-                return # Игнорируем сообщения от забаненных
+                return
         return await handler(event, data)
 
 dp.message.middleware(BanMiddleware())
@@ -111,8 +108,6 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
             await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} закрыта по таймауту.")
         except: pass
 
-# --- КОМАНДЫ ---
-
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -127,7 +122,8 @@ async def start(message: types.Message, state: FSMContext):
         f"Если есть дополнительные вопросы, обращайтесь."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")]
+        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")],
+        [InlineKeyboardButton(text="📝 Оценить бота", callback_data="show_reviews")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -175,7 +171,6 @@ async def process_rating(callback: types.CallbackQuery):
     
     await callback.answer("Спасибо за ваш отзыв! ⭐", show_alert=True)
     
-    # Отправляем тебе уведомление с кнопками удаления и бана
     user_info = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🗑 Удалить оценку", callback_data=f"delrev_{review_id}"),
@@ -206,8 +201,6 @@ async def process_report(message: types.Message, state: FSMContext):
     await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
     await state.clear()
 
-# --- ОБРАБОТКА КНОПОК АДМИНА (УДАЛЕНИЕ И БАН) ---
-
 @dp.callback_query(F.data.startswith("delrev_"))
 async def delete_review(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
@@ -227,6 +220,11 @@ async def ban_user(callback: types.CallbackQuery):
     try:
         await bot.send_message(user_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
     except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "show_reviews")
+async def show_reviews(callback: types.CallbackQuery):
+    await cmd_review(callback.message)
     await callback.answer()
 
 # --- ЛОГИКА СДЕЛОК ---
@@ -258,12 +256,17 @@ async def process_recipient(message: types.Message, state: FSMContext):
     price = calculate_price(stars)
     now = datetime.datetime.now()
     expires = now + datetime.timedelta(minutes=DEAL_TIMEOUT_MINUTES)
+    
+    # Генерируем случайный 5-значный ID сделки
+    deal_id = random.randint(10000, 99999)
+    while get_deal(deal_id): # Проверка, чтобы не было совпадений
+        deal_id = random.randint(10000, 99999)
+
     cursor.execute("""
-        INSERT INTO deals (buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
-    """, (message.from_user.id, message.from_user.username or "нет", stars, recipient, price, now.isoformat(), expires.isoformat()))
+        INSERT INTO deals (id, buyer_id, buyer_username, stars_amount, recipient_username, price_uah, status, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    """, (deal_id, message.from_user.id, message.from_user.username or "нет", stars, recipient, price, now.isoformat(), expires.isoformat()))
     conn.commit()
-    deal_id = cursor.lastrowid
 
     await message.answer(
         f"✅ Сделка #{deal_id} создана.\nЗвёзд: {stars}\nК оплате: {price:.2f} грн\n"
@@ -289,7 +292,7 @@ async def admin_accept(callback: types.CallbackQuery):
     deal_id = int(callback.data.split("_")[1])
     deal = get_deal(deal_id)
     if not deal or deal[6] != 'pending':
-        await callback.answer("Сделка неактивна", show_alert=True); return
+        await callback.answer("Сделка неактивна (возможно, база данных сервера обновилась)", show_alert=True); return
 
     update_deal_status(deal_id, 'accepted')
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
