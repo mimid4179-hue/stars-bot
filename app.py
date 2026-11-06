@@ -2,8 +2,9 @@ import asyncio
 import sqlite3
 import datetime
 import os
+from typing import Callable, Dict, Any, Awaitable
 from aiohttp import web
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import Bot, Dispatcher, F, types, BaseMiddleware
 from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -50,13 +51,37 @@ CREATE TABLE IF NOT EXISTS reviews (
     rating INTEGER
 )
 """)
+# Таблица для забаненных пользователей
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS banned_users (
+    user_id INTEGER PRIMARY KEY
+)
+""")
 conn.commit()
+
+# --- МИДЛВАРЬ ДЛЯ БАНОВ (блокирует спамеров) ---
+class BanMiddleware(BaseMiddleware):
+    async def __call__(
+        self,
+        handler: Callable[[types.TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: types.TelegramObject,
+        data: Dict[str, Any]
+    ) -> Any:
+        user = getattr(event, 'from_user', None)
+        if user and user.id != ADMIN_ID:
+            cursor.execute("SELECT * FROM banned_users WHERE user_id = ?", (user.id,))
+            if cursor.fetchone():
+                return # Игнорируем сообщения от забаненных
+        return await handler(event, data)
+
+dp.message.middleware(BanMiddleware())
+dp.callback_query.middleware(BanMiddleware())
 
 class DealForm(StatesGroup):
     waiting_stars = State()
     waiting_recipient = State()
     waiting_receipt = State()
-    waiting_report = State() # Новое состояние для жалобы
+    waiting_report = State()
 
 def calculate_price(stars: int) -> float:
     if stars < 100:
@@ -92,7 +117,7 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
 async def start(message: types.Message, state: FSMContext):
     await state.clear()
     text = (
-        f"Здравствуйте, {message.from_user.first_name}!\n\n"
+        f"Здравствуйте!\n\n"
         f"Это бот для покупки звезд.\n\n"
         f"💵 <b>Курс:</b>\n"
         f"50-99 звезд — 0.8 грн\n"
@@ -102,8 +127,7 @@ async def start(message: types.Message, state: FSMContext):
         f"Если есть дополнительные вопросы, обращайтесь."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")],
-        [InlineKeyboardButton(text="📝 Оценить бота", callback_data="show_reviews")]
+        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="new_deal")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
@@ -146,13 +170,19 @@ async def process_rating(callback: types.CallbackQuery):
         return
 
     cursor.execute("INSERT INTO reviews (user_id, rating) VALUES (?, ?)", (user_id, rating))
+    review_id = cursor.lastrowid
     conn.commit()
     
-    # Всплывающее окно после оценки
     await callback.answer("Спасибо за ваш отзыв! ⭐", show_alert=True)
     
+    # Отправляем тебе уведомление с кнопками удаления и бана
+    user_info = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить оценку", callback_data=f"delrev_{review_id}"),
+         InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{user_id}")]
+    ])
     try:
-        await bot.send_message(ADMIN_ID, f"⭐ Новая оценка от @{callback.from_user.username or user_id}: {rating} звёзд!")
+        await bot.send_message(ADMIN_ID, f"⭐ Новая оценка от {user_info}: {rating} звёзд!", reply_markup=admin_kb)
     except: pass
 
 @dp.message(Command("report"))
@@ -160,24 +190,43 @@ async def cmd_report(message: types.Message, state: FSMContext):
     await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
     await state.set_state(DealForm.waiting_report)
 
-# Ловим текст жалобы
 @dp.message(DealForm.waiting_report)
 async def process_report(message: types.Message, state: FSMContext):
     report_text = message.text
     user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
     
-    # Пересылаем жалобу тебе
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
+    ])
+    
     try:
-        await bot.send_message(ADMIN_ID, f"🚨 <b>Новая жалоба!</b>\n\nОт: {user_info}\nТекст: {report_text}", parse_mode="HTML")
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Новая жалоба!</b>\n\nОт: {user_info}\nТекст: {report_text}", reply_markup=admin_kb, parse_mode="HTML")
     except: pass
 
-    # Ответ пользователю
     await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
     await state.clear()
 
-@dp.callback_query(F.data == "show_reviews")
-async def show_reviews(callback: types.CallbackQuery):
-    await cmd_review(callback.message)
+# --- ОБРАБОТКА КНОПОК АДМИНА (УДАЛЕНИЕ И БАН) ---
+
+@dp.callback_query(F.data.startswith("delrev_"))
+async def delete_review(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    review_id = int(callback.data.split("_")[1])
+    cursor.execute("DELETE FROM reviews WHERE id = ?", (review_id,))
+    conn.commit()
+    await callback.message.edit_text(callback.message.text + "\n\n🗑 <b>Оценка удалена.</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def ban_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    user_id = int(callback.data.split("_")[1])
+    cursor.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
+    await callback.message.edit_text(callback.message.text + "\n\n🚫 <b>Пользователь забанен.</b>", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
+    except: pass
     await callback.answer()
 
 # --- ЛОГИКА СДЕЛОК ---
