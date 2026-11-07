@@ -107,12 +107,12 @@ class DealForm(StatesGroup):
     chat_buyer = State()
     chat_admin = State()
 
-def calculate_price(stars: int, deal_type: str = 'balance') -> float:
+def calculate_price(stars: int, deal_type: str = 'balance') -> int:
     if deal_type == 'gift':
-        return stars * 0.75
+        return int(stars * 0.75 + 0.5)
     if stars < 100:
-        return stars * 0.8
-    return stars * 0.75
+        return int(stars * 0.8 + 0.5)
+    return int(stars * 0.75 + 0.5)
 
 def get_deal(deal_id: int):
     cursor.execute("SELECT * FROM deals WHERE id = %s", (deal_id,))
@@ -135,6 +135,46 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
         try:
             await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} отменена по таймауту.")
         except: pass
+
+# ==================== КОМАНДЫ (СТРОГО В НАЧАЛЕ) ====================
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        cursor.execute("SELECT COUNT(*) AS c FROM reviews")
+        rev_count = cursor.fetchone()['c']
+        cursor.execute("SELECT COUNT(*) AS c FROM deals")
+        deal_count = cursor.fetchone()['c']
+        await message.answer(f"📊 <b>Статистика базы данных:</b>\n\nОценок: {rev_count}\nСделок: {deal_count}\n\nБаза данных: Подключена ✅", parse_mode="HTML")
+    except Exception as e:
+        await message.answer(f"❌ <b>Ошибка базы данных:</b>\n<code>{e}</code>", parse_mode="HTML")
+
+@dp.message(Command("review"))
+async def cmd_review(message: types.Message):
+    # Явно указываем алиасы для колонок, чтобы не было ошибок
+    cursor.execute("SELECT COUNT(*) AS cnt, AVG(rating) AS avg_rt FROM reviews")
+    result = cursor.fetchone()
+    count = result['cnt'] if result['cnt'] else 0
+    avg_rating = round(result['avg_rt'], 1) if result['avg_rt'] else 0.0
+
+    text = (
+        f"Пожалуйста, оставьте отзыв о нашей работе в канале!\n\n"
+        f"📊 <b>Средняя оценка:</b> {avg_rating} ⭐ (Всего оценок: {count})\n\n"
+        f"Выберите оценку ниже:"
+    )
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1⭐", callback_data="rate_1"),
+            InlineKeyboardButton(text="2⭐", callback_data="rate_2"),
+            InlineKeyboardButton(text="3⭐", callback_data="rate_3"),
+            InlineKeyboardButton(text="4⭐", callback_data="rate_4"),
+            InlineKeyboardButton(text="5⭐", callback_data="rate_5")
+        ],
+        [InlineKeyboardButton(text="Перейти в канал с отзывами", url=REVIEWS_CHANNEL)]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.message(CommandStart())
 async def start(message: types.Message, state: FSMContext):
@@ -175,6 +215,14 @@ async def cmd_buy(message: types.Message, state: FSMContext):
         await message.answer("У вас уже есть активная сделка. Пожалуйста, дождитесь её завершения.")
         return
     await choose_type(message, state)
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message, state: FSMContext):
+    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
+    await state.set_state(DealForm.waiting_report)
+
+
+# ==================== КОЛБЭКИ И СОСТОЯНИЯ ====================
 
 async def choose_type(message_or_callback, state: FSMContext):
     text = (
@@ -235,7 +283,7 @@ async def show_gift_menu(message: types.Message, state: FSMContext):
     total_stars = sum(GIFTS[k]['stars'] for k in selected)
     total_price = calculate_price(total_stars, 'gift') if total_stars > 0 else 0
     
-    text += f"\nВыбрано: <b>{total_stars} ⭐</b> на сумму <b>{total_price:.2f} грн</b>"
+    text += f"\nВыбрано: <b>{total_stars} ⭐</b> на сумму <b>{total_price} грн</b>"
     
     buttons.append([InlineKeyboardButton(text="🗑 Очистить выбор", callback_data="gift_clear")])
     buttons.append([InlineKeyboardButton(text="✅ Подтвердить выбор", callback_data="gift_confirm")])
@@ -326,7 +374,7 @@ async def process_recipient(message: types.Message, state: FSMContext):
     
     stars = data.get('stars')
     if not stars:
-        await message.answer("Ошибка: данные о сделке утеряны (возможно, прошло слишком много времени). Пожалуйста, начните заново, нажав /start.")
+        await message.answer("Ошибка: данные о сделке утеряны. Пожалуйста, начните заново, нажав /start.")
         await state.clear()
         return
 
@@ -351,8 +399,8 @@ async def process_recipient(message: types.Message, state: FSMContext):
         """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat()))
     except Exception as e:
         print(f"DB ERROR: {e}")
-        await message.answer("❌ Произошла ошибка при создании сделки. Администратор уже уведомлен.")
-        await bot.send_message(ADMIN_ID, f"🚨 <b>Ошибка Базы Данных при создании сделки!</b>\n\n<code>{str(e)}</code>", parse_mode="HTML")
+        await message.answer("❌ Произошла ошибка при создании сделки.")
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Ошибка Базы Данных:</b>\n<code>{str(e)}</code>", parse_mode="HTML")
         await state.clear()
         return
 
@@ -367,7 +415,7 @@ async def process_recipient(message: types.Message, state: FSMContext):
         f"✅ Сделка #{deal_id} создана.\n"
         f"Тип: {type_text}\n"
         f"Звёзд: {stars}{gift_text}\n"
-        f"К оплате: {price:.2f} грн\n"
+        f"К оплате: {price} грн\n"
         f"Получатель: @{recipient}\n\n"
         f"Жди подтверждения от админа. Время: {DEAL_TIMEOUT_MINUTES} мин."
     )
@@ -392,12 +440,14 @@ async def process_recipient(message: types.Message, state: FSMContext):
         f"Тип: {type_text}{anon_info}\n"
         f"Покупатель: @{message.from_user.username or message.from_user.id}\n"
         f"Звёзд: {stars}{gift_text}\n"
-        f"Цена: {price:.2f} грн\n"
+        f"Цена: {price} грн\n"
         f"Получатель: @{recipient}"
     )
     await bot.send_message(ADMIN_ID, admin_msg, reply_markup=admin_kb)
     asyncio.create_task(close_expired_deal(deal_id, message.from_user.id))
     await state.clear()
+
+# --- ОСТАЛЬНЫЕ КОЛБЭКИ ---
 
 @dp.callback_query(F.data.startswith("accept_"))
 async def admin_accept(callback: types.CallbackQuery):
@@ -423,10 +473,12 @@ async def admin_accept(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
         [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")]
     ])
+    
+    price_display = int(deal['price_uah'])
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\n"
         f"Тип: {deal_type_text}{gift_text}\n"
-        f"Переведи {deal['price_uah']:.2f} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\n"
+        f"Переведи {price_display} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\n"
         f"После оплаты нажми кнопку и прикрепи скриншот.",
         reply_markup=buyer_kb, parse_mode="Markdown"
     )
@@ -492,12 +544,14 @@ async def process_receipt(message: types.Message, state: FSMContext):
         else:
             admin_instruction = f"\n❗️ Отправить БЕЗ скрытия имени (от @{deal['buyer_username']})"
 
+    price_display = int(deal['price_uah'])
+
     await bot.send_photo(ADMIN_ID, photo=file_id,
         caption=f"💰 Чек по сделке #{deal_id}\n"
                 f"Тип: {deal_type_text}{gift_text}{admin_instruction}\n"
                 f"Звёзд: {deal['stars_amount']}\n"
                 f"Получатель: @{deal['recipient_username']}\n"
-                f"Сумма: {deal['price_uah']:.2f} грн\n\n"
+                f"Сумма: {price_display} грн\n\n"
                 f"Проверь оплату и отправь звёзды через Fragment.",
         reply_markup=admin_kb
     )
@@ -620,12 +674,6 @@ async def process_chat_admin(message: types.Message, state: FSMContext):
             await message.answer("Не удалось отправить сообщение (возможно, пользователь заблокировал бота).")
     await state.clear()
 
-@dp.message(Command("report"))
-async def cmd_report(message: types.Message, state: FSMContext):
-    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
-    await state.set_state(DealForm.waiting_report)
-
-# СРАБАТЫВАЕТ ТОЛЬКО НА ТЕКСТ, КОТОРЫЙ НЕ ЯВЛЯЕТСЯ КОМАНДОЙ
 @dp.message(DealForm.waiting_report, F.text, ~F.text.startswith('/'))
 async def process_report(message: types.Message, state: FSMContext):
     user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
@@ -635,12 +683,11 @@ async def process_report(message: types.Message, state: FSMContext):
     ])
     
     try:
-        # Отправляем тебе текст жалобы красиво отформатированным
+        forwarded_msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
         await bot.send_message(
             ADMIN_ID, 
-            f"🚨 <b>Новая жалоба!</b>\n\n"
-            f"От: {user_info}\n"
-            f"Текст: <blockquote>{message.text}</blockquote>", 
+            f"🚨 <b>Новая жалоба!</b>\nОт: {user_info}", 
+            reply_to_message_id=forwarded_msg.message_id,
             reply_markup=admin_kb, 
             parse_mode="HTML"
         )
@@ -649,38 +696,6 @@ async def process_report(message: types.Message, state: FSMContext):
 
     await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
     await state.clear()
-
-@dp.message(F.text)
-async def handle_text_review(message: types.Message):
-    if message.text.startswith('/'): return
-    
-    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND awaiting_review = 1 ORDER BY id DESC LIMIT 1", (message.from_user.id,))
-    deal = cursor.fetchone()
-    
-    if deal:
-        deal_id = deal['id']
-        user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
-        
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"contact_{message.from_user.id}")],
-            [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
-        ])
-        try:
-            # Отправляем текст отзыва красиво отформатированным
-            await bot.send_message(
-                ADMIN_ID, 
-                f"📝 <b>Отзыв к сделке #{deal_id}</b>\n\n"
-                f"От: {user_info}\n"
-                f"Текст: <blockquote>{message.text}</blockquote>", 
-                reply_markup=admin_kb,
-                parse_mode="HTML"
-            )
-        except Exception as e:
-            print(f"Error sending review: {e}")
-
-        cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
-        await message.answer("Спасибо за ваш отзыв! ❤️")
-        return
 
 @dp.callback_query(F.data.startswith("delrev_"))
 async def delete_review(callback: types.CallbackQuery):
@@ -700,29 +715,6 @@ async def ban_user(callback: types.CallbackQuery):
         await bot.send_message(user_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
     except: pass
     await callback.answer()
-
-@dp.message(Command("review"))
-async def cmd_review(message: types.Message):
-    cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
-    result = cursor.fetchone()
-    count = result['count']
-    avg_rating = round(result['avg'], 1) if result['avg'] else 0.0
-
-    text = f"Пожалуйста, оставьте отзыв о нашей работе в канале!\n\n"
-    text += f"📊 <b>Средняя оценка:</b> {avg_rating} ⭐ (Всего оценок: {count})\n\n"
-    text += f"Выберите оценку ниже:"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="1⭐", callback_data="rate_1"),
-            InlineKeyboardButton(text="2⭐", callback_data="rate_2"),
-            InlineKeyboardButton(text="3⭐", callback_data="rate_3"),
-            InlineKeyboardButton(text="4⭐", callback_data="rate_4"),
-            InlineKeyboardButton(text="5⭐", callback_data="rate_5")
-        ],
-        [InlineKeyboardButton(text="Перейти в канал с отзывами", url=REVIEWS_CHANNEL)]
-    ])
-    await message.answer(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("rate_"))
 async def process_rating(callback: types.CallbackQuery):
@@ -756,6 +748,39 @@ async def process_rating(callback: types.CallbackQuery):
 async def show_reviews(callback: types.CallbackQuery):
     await cmd_review(callback.message)
     await callback.answer()
+
+# ==================== ЛОВИМ ВСЁ ОСТАЛЬНОЕ (В САМОМ КОНЦЕ) ====================
+
+@dp.message(F.text)
+async def handle_text_review(message: types.Message):
+    if message.text.startswith('/'): return
+    
+    cursor.execute("SELECT id FROM deals WHERE buyer_id = %s AND awaiting_review = 1 ORDER BY id DESC LIMIT 1", (message.from_user.id,))
+    deal = cursor.fetchone()
+    
+    if deal:
+        deal_id = deal['id']
+        user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+        
+        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"contact_{message.from_user.id}")],
+            [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
+        ])
+        try:
+            forwarded_msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+            await bot.send_message(
+                ADMIN_ID, 
+                f"📝 <b>Отзыв к сделке #{deal_id}</b>\nОт: {user_info}", 
+                reply_to_message_id=forwarded_msg.message_id,
+                reply_markup=admin_kb,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            print(f"Error sending review: {e}")
+
+        cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
+        await message.answer("Спасибо за ваш отзыв! ❤️")
+        return
 
 async def handle(request):
     return web.Response(text="Bot is running!")
