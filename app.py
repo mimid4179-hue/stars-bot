@@ -117,7 +117,6 @@ class DealForm(StatesGroup):
     chat_buyer = State()
     chat_admin = State()
 
-# ФУНКЦИЯ РАСЧЕТА ЦЕНЫ С ОКРУГЛЕНИЕМ
 def calculate_price(stars: int, deal_type: str = 'balance', currency: str = 'UAH') -> int:
     if currency == 'UAH':
         if deal_type == 'gift':
@@ -293,7 +292,6 @@ async def cancel_deal_cb(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Действие отменено. Вы можете начать заново, нажав /start.")
     await callback.answer()
 
-# 1. ВЫБОР ВАЛЮТЫ
 async def choose_currency(message_or_callback, state: FSMContext):
     text = "Выберите валюту для оплаты:"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -324,7 +322,6 @@ async def back_to_currency(callback: types.CallbackQuery, state: FSMContext):
     await choose_currency(callback, state)
     await callback.answer()
 
-# 2. ВЫБОР ТИПА (БАЛАНС ИЛИ ПОДАРОК)
 async def choose_type(message_or_callback, state: FSMContext):
     data = await state.get_data()
     curr = data.get('currency', 'UAH')
@@ -571,8 +568,6 @@ async def process_recipient(message: types.Message, state: FSMContext):
     asyncio.create_task(close_expired_deal(deal_id, message.from_user.id))
     await state.clear()
 
-# --- ОСТАЛЬНЫЕ КОЛБЭКИ ---
-
 @dp.callback_query(F.data.startswith("accept_"))
 async def admin_accept(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -594,7 +589,6 @@ async def admin_accept(callback: types.CallbackQuery):
         anon_text = " (Анонимно 🕵️‍♂️)" if deal['is_anonymous'] else ""
         gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
-    # Выбираем реквизиты в зависимости от валюты
     if currency == 'UAH':
         reqs = f"`{CARD_NUMBER_UAH}`\n{CARD_NAME_UAH}"
     else:
@@ -638,18 +632,35 @@ async def buyer_paid(callback: types.CallbackQuery, state: FSMContext):
     if not deal or deal['status'] != 'accepted':
         await callback.answer("Сделка не ждёт оплаты", show_alert=True); return
     await state.update_data(deal_id=deal_id)
-    await callback.message.answer("Отправь скриншот или фото чека:", reply_markup=get_nav_kb("cancel_deal"))
+    
+    # НОВЫЙ ТЕКСТ ДЛЯ ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
+    text = (
+        "📎 <b>Пожалуйста, отправьте подтверждение оплаты.</b>\n\n"
+        "Желательно в виде <b>PDF-квитанции</b> из банковского приложения, "
+        "либо качественного скриншота/фото чека:"
+    )
+    
+    await callback.message.answer(text, reply_markup=get_nav_kb("cancel_deal"), parse_mode="HTML")
     await state.set_state(DealForm.waiting_receipt)
     await callback.answer()
 
-@dp.message(DealForm.waiting_receipt, F.photo)
+@dp.message(DealForm.waiting_receipt, F.photo | F.document)
 async def process_receipt(message: types.Message, state: FSMContext):
     data = await state.get_data()
     deal_id = data.get('deal_id')
     if not deal_id:
         await message.answer("Ошибка."); await state.clear(); return
 
-    file_id = message.photo[-1].file_id
+    is_document = False
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document:
+        file_id = message.document.file_id
+        is_document = True
+    else:
+        await message.answer("Пожалуйста, отправьте именно фото или PDF-документ с чеком.")
+        return
+
     update_deal_status(deal_id, 'paid', file_id)
     deal = get_deal(deal_id)
     await message.answer(f"✅ Чек по сделке #{deal_id} получен. Жди выдачи звёзд.")
@@ -681,15 +692,20 @@ async def process_receipt(message: types.Message, state: FSMContext):
 
     price_display = int(deal['price_uah'])
 
-    await bot.send_photo(ADMIN_ID, photo=file_id,
-        caption=f"💰 Чек по сделке #{deal_id} ({currency})\n"
-                f"Тип: {deal_type_text}{gift_text}{admin_instruction}\n"
-                f"Звёзд: {deal['stars_amount']}\n"
-                f"Получатель: @{deal['recipient_username']}\n"
-                f"Сумма: {price_display} {curr_symbol}\n\n"
-                f"Проверь оплату и отправь звёзды через Fragment.",
-        reply_markup=admin_kb
+    caption_text = (
+        f"💰 Чек по сделке #{deal_id} ({currency})\n"
+        f"Тип: {deal_type_text}{gift_text}{admin_instruction}\n"
+        f"Звёзд: {deal['stars_amount']}\n"
+        f"Получатель: @{deal['recipient_username']}\n"
+        f"Сумма: {price_display} {curr_symbol}\n\n"
+        f"Проверь оплату и отправь звёзды через Fragment."
     )
+
+    if is_document:
+        await bot.send_document(ADMIN_ID, document=file_id, caption=caption_text, reply_markup=admin_kb)
+    else:
+        await bot.send_photo(ADMIN_ID, photo=file_id, caption=caption_text, reply_markup=admin_kb)
+        
     await state.clear()
 
 @dp.callback_query(F.data.startswith("sendscreen_"))
