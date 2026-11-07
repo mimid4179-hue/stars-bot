@@ -47,15 +47,12 @@ conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cursor = conn.cursor(cursor_factory=DictCursor)
 
-# 1. Сначала создаем таблицу (если её нет)
+# 1. Создаем базовую таблицу, если её нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
     buyer_id BIGINT,
     buyer_username TEXT,
-    deal_type TEXT DEFAULT 'balance',
-    gift_items TEXT,
-    is_anonymous BOOLEAN DEFAULT FALSE,
     stars_amount INTEGER,
     recipient_username TEXT,
     price_uah REAL,
@@ -66,7 +63,10 @@ CREATE TABLE IF NOT EXISTS deals (
     awaiting_review INTEGER DEFAULT 0
 )
 """)
-# 2. Затем добавляем колонку (если таблица была создана в старой версии)
+
+# 2. Принудительно добавляем новые колонки, если их нет (чтобы починить старую базу)
+cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS deal_type TEXT DEFAULT 'balance'")
+cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS gift_items TEXT")
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
 
 cursor.execute("""
@@ -268,9 +268,10 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👤 Нет, показать мое имя", callback_data="anon_no")],
-            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть имя", callback_data="anon_yes")]
+            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть мое имя", callback_data="anon_yes")]
         ])
-        await callback.message.answer("Хотите ли вы скрыть свое имя при отправке подарка?", reply_markup=kb)
+        # ИЗМЕНЕН ТЕКСТ ТУТ
+        await callback.message.answer("Хотите ли вы скрыть ваше имя (отправителя) при отправке подарка?", reply_markup=kb)
         await state.set_state(DealForm.choosing_anonymity)
         await callback.answer()
         return
