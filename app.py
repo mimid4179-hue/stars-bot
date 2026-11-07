@@ -47,8 +47,7 @@ conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cursor = conn.cursor(cursor_factory=DictCursor)
 
-cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
-
+# 1. Сначала создаем таблицу (если её нет)
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
@@ -67,6 +66,9 @@ CREATE TABLE IF NOT EXISTS deals (
     awaiting_review INTEGER DEFAULT 0
 )
 """)
+# 2. Затем добавляем колонку (если таблица была создана в старой версии)
+cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reviews (
     id SERIAL PRIMARY KEY,
@@ -302,6 +304,9 @@ async def handle_anonymity(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(DealForm.waiting_stars)
 async def process_stars(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пожалуйста, отправь число.")
+        return
     try:
         stars = int(message.text)
         if stars < 50:
@@ -315,9 +320,19 @@ async def process_stars(message: types.Message, state: FSMContext):
 
 @dp.message(DealForm.waiting_recipient)
 async def process_recipient(message: types.Message, state: FSMContext):
+    if not message.text:
+        await message.answer("Пожалуйста, отправь @username текстом.")
+        return
+
     recipient = message.text.strip().replace("@", "")
     data = await state.get_data()
-    stars = data['stars']
+    
+    stars = data.get('stars')
+    if not stars:
+        await message.answer("Ошибка: данные о сделке утеряны (возможно, прошло слишком много времени). Пожалуйста, начните заново, нажав /start.")
+        await state.clear()
+        return
+
     deal_type = data.get('deal_type', 'balance')
     selected_gifts = data.get('selected_gifts', [])
     is_anonymous = data.get('is_anonymous', False)
@@ -332,10 +347,17 @@ async def process_recipient(message: types.Message, state: FSMContext):
     while get_deal(deal_id):
         deal_id = random.randint(10000, 99999)
 
-    cursor.execute("""
-        INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, is_anonymous, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
-    """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat()))
+    try:
+        cursor.execute("""
+            INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, is_anonymous, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
+        """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat()))
+    except Exception as e:
+        print(f"DB ERROR: {e}")
+        await message.answer("❌ Произошла ошибка при создании сделки. Администратор уже уведомлен.")
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Ошибка Базы Данных при создании сделки!</b>\n\n<code>{str(e)}</code>", parse_mode="HTML")
+        await state.clear()
+        return
 
     type_text = "🎁 Подарком" if deal_type == 'gift' else "⭐ На баланс"
     gift_text = ""
@@ -360,7 +382,6 @@ async def process_recipient(message: types.Message, state: FSMContext):
          InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
     ])
     
-    # Уведомление для АДМИНА (тебя)
     anon_info = ""
     if deal_type == 'gift':
         if is_anonymous:
