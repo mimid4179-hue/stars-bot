@@ -17,11 +17,9 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
 
-# Реквизиты для гривны (UAH)
 CARD_NUMBER_UAH = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
 CARD_NAME_UAH = os.environ.get("CARD_NAME", "Имя Фамилия")
 
-# Реквизиты для рубля (RUB)
 RUB_PHONE = os.environ.get("RUB_PHONE", "+7 900 087 3812")
 RUB_NAME = os.environ.get("RUB_NAME", "Алексей М.")
 RUB_BANK = os.environ.get("RUB_BANK", "Альфа Банк")
@@ -163,6 +161,48 @@ def get_nav_kb(back_cb: str):
     ])
 
 # ==================== КОМАНДЫ ====================
+
+@dp.message(Command("bans"))
+async def cmd_bans(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    await show_bans_list(message)
+
+async def show_bans_list(message_or_callback):
+    cursor.execute("SELECT user_id FROM banned_users")
+    banned = cursor.fetchall()
+    
+    if not banned:
+        txt = "📭 Забаненных пользователей нет."
+        if isinstance(message_or_callback, types.Message):
+            await message_or_callback.answer(txt)
+        else:
+            await message_or_callback.message.edit_text(txt)
+        return
+
+    text = "🚫 <b>Список забаненных пользователей:</b>\n\n"
+    kb_buttons = []
+    for b in banned:
+        uid = b['user_id']
+        text += f"ID: <code>{uid}</code>\n"
+        kb_buttons.append([InlineKeyboardButton(text=f"✅ Разбанить {uid}", callback_data=f"unban_{uid}")])
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    
+    if isinstance(message_or_callback, types.Message):
+        await message_or_callback.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await message_or_callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("unban_"))
+async def unban_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    user_id = int(callback.data.split("_")[-1])
+    cursor.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
+    await callback.answer(f"Пользователь {user_id} разбанен!", show_alert=True)
+    try:
+        await bot.send_message(user_id, "✅ Вы были разблокированы администратором. Вы снова можете пользоваться ботом.")
+    except: pass
+    await show_bans_list(callback)
 
 @dp.message(Command("deals"))
 async def cmd_deals(message: types.Message):
@@ -594,7 +634,6 @@ async def admin_accept(callback: types.CallbackQuery):
     else:
         reqs = f"📱 Номер: `{RUB_PHONE}`\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
 
-    # ДОБАВЛЯЕМ ВТОРУЮ КНОПКУ ОТМЕНЫ (НЕ ТОТ БАНК)
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
         [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
@@ -604,7 +643,6 @@ async def admin_accept(callback: types.CallbackQuery):
     
     price_display = int(deal['price_uah'])
     
-    # ДОБАВЛЯЕМ ТЕКСТ С ПРЕДУПРЕЖДЕНИЕМ
     warning_text = (
         "\n\n⚠️ <b>Внимание!</b> Если вы отправили средства на реквизиты другого банка, "
         "товар выдан не будет, а средства не возвращаются. Сделка будет отменена."
@@ -779,7 +817,6 @@ async def buyer_cancel(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
     await callback.answer()
 
-# НОВЫЙ ОБРАБОТЧИК ДЛЯ ОТМЕНЫ ИЗ-ЗА БАНКА
 @dp.callback_query(F.data.startswith("wrong_bank_cancel_"))
 async def wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
     deal_id = int(callback.data.split("_")[-1])
@@ -788,7 +825,6 @@ async def wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
     if deal and deal['status'] in ('pending', 'accepted', 'paid'):
         update_deal_status(deal_id, 'cancelled')
         
-        # Сообщение покупателю
         cancel_msg = (
             callback.message.text + 
             "\n\n⛔️ <b>Вы отменили сделку из-за выбора неверного банка.</b>\n"
@@ -799,7 +835,6 @@ async def wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
         except:
             await callback.message.answer("Вы отменили сделку из-за неверного банка. Средства не возвращаются.")
             
-        # Уведомление тебе (админу)
         await bot.send_message(
             ADMIN_ID, 
             f"⛔️ <b>Покупатель отменил сделку #{deal_id} (Ошибся банком)!</b>\n"
