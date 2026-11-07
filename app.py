@@ -136,7 +136,6 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
             await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} отменена по таймауту.")
         except: pass
 
-# Клавиатура для отмены/возврата
 def get_nav_kb(back_cb: str):
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -145,7 +144,7 @@ def get_nav_kb(back_cb: str):
         ]
     ])
 
-# ==================== КОМАНДЫ (СТРОГО В НАЧАЛЕ) ====================
+# ==================== КОМАНДЫ ====================
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
@@ -209,6 +208,7 @@ async def start(message: types.Message, state: FSMContext):
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="choose_type")],
+        [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
         [InlineKeyboardButton(text="📝 Оценить бота", callback_data="show_reviews")]
     ])
     await message.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -224,6 +224,11 @@ async def cmd_buy(message: types.Message, state: FSMContext):
         return
     await choose_type(message, state)
 
+@dp.message(Command("chat"))
+async def cmd_chat(message: types.Message, state: FSMContext):
+    await message.answer("Напишите ваше сообщение для продавца. Оно будет доставлено лично в чат.")
+    await state.set_state(DealForm.chat_buyer)
+
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message, state: FSMContext):
     await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.", reply_markup=get_nav_kb("cancel_deal"))
@@ -236,9 +241,9 @@ async def cmd_report(message: types.Message, state: FSMContext):
 async def cancel_deal_cb(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
     try:
-        await callback.message.edit_text("❌ Сделка отменена. Вы можете начать заново, нажав /start.")
+        await callback.message.edit_text("❌ Действие отменено. Вы можете начать заново, нажав /start.")
     except:
-        await callback.message.answer("❌ Сделка отменена. Вы можете начать заново, нажав /start.")
+        await callback.message.answer("❌ Действие отменено. Вы можете начать заново, нажав /start.")
     await callback.answer()
 
 async def choose_type(message_or_callback, state: FSMContext):
@@ -675,7 +680,7 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "contact_admin")
 async def contact_admin(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Напишите ваше сообщение для продавца. Оно будет доставлено лично в чат.")
+    await callback.message.answer("Напишите ваше сообщение для продавца. Оно будет доставлено лично в чат.", reply_markup=get_nav_kb("cancel_deal"))
     await state.set_state(DealForm.chat_buyer)
     await callback.answer()
 
@@ -785,7 +790,7 @@ async def show_reviews(callback: types.CallbackQuery):
     await cmd_review(callback.message)
     await callback.answer()
 
-# ==================== ЛОВИМ ВСЁ ОСТАЛЬНОЕ (В САМОМ КОНЦЕ) ====================
+# ==================== ЛОВИМ ВСЁ ОСТАЛЬНОЕ ====================
 
 @dp.message(F.text)
 async def handle_text_review(message: types.Message):
