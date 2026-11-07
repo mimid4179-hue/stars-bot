@@ -146,6 +146,34 @@ def get_nav_kb(back_cb: str):
 
 # ==================== КОМАНДЫ ====================
 
+@dp.message(Command("deals"))
+async def cmd_deals(message: types.Message):
+    if message.from_user.id != ADMIN_ID: return
+    
+    cursor.execute("SELECT * FROM deals ORDER BY created_at DESC LIMIT 20")
+    deals = cursor.fetchall()
+    
+    if not deals:
+        await message.answer("📭 Сделок пока нет.")
+        return
+        
+    text = "📋 <b>Последние 20 сделок:</b>\n\n"
+    for d in deals:
+        status_map = {
+            'pending': '⏳ Ожидает',
+            'accepted': '✅ Принята',
+            'paid': '💰 Оплачена',
+            'completed': '🎉 Завершена',
+            'declined': '❌ Отклонена',
+            'cancelled': '🚫 Отменена',
+            'expired': '⌛️ Просрочена'
+        }
+        status = status_map.get(d['status'], d['status'])
+        text += f"#{d['id']} | {d['stars_amount']}⭐ | {int(d['price_uah'])} грн | {status}\n"
+        text += f"Покупатель: @{d['buyer_username']} | Получатель: @{d['recipient_username']}\n\n"
+        
+    await message.answer(text, parse_mode="HTML")
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: types.Message):
     if message.from_user.id != ADMIN_ID: return
@@ -198,9 +226,9 @@ async def start(message: types.Message, state: FSMContext):
     text = (
         f"Здравствуйте!\n\n"
         f"Тут вы можете купить моментальные звёзды на баланс либо подарком.\n"
-        f"✅ Звезды приходят моментально, всё абсолютно безопасно.\n\n"
+        f"✅ Звёзды приходят моментально, всё абсолютно безопасно.\n\n"
         f"💵 <b>Курс:</b>\n"
-        f"50-99 звезд — 0.8 грн\n"
+        f"50-99 звёзд — 0.8 грн\n"
         f"от 100 — 0.75 грн\n\n"
         f"👤 Мой профиль: {MY_USERNAME}\n"
         f"🌟 Отзывы: @otzfrosy\n\n"
