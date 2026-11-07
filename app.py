@@ -47,7 +47,6 @@ conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cursor = conn.cursor(cursor_factory=DictCursor)
 
-# Добавляем колонку is_anonymous, если её еще нет
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
 
 cursor.execute("""
@@ -265,12 +264,11 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
         total_stars = sum(GIFTS[k]['stars'] for k in selected)
         await state.update_data(stars=total_stars)
         
-        # Спрашиваем про анонимность
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🕵️‍♂️ Да, отправить анонимно", callback_data="anon_yes")],
-            [InlineKeyboardButton(text="👤 Нет, от моего имени", callback_data="anon_no")]
+            [InlineKeyboardButton(text="👤 Нет, показать мое имя", callback_data="anon_no")],
+            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть имя", callback_data="anon_yes")]
         ])
-        await callback.message.answer("Хотите ли вы отправить подарок анонимно?", reply_markup=kb)
+        await callback.message.answer("Хотите ли вы скрыть свое имя при отправке подарка?", reply_markup=kb)
         await state.set_state(DealForm.choosing_anonymity)
         await callback.answer()
         return
@@ -293,7 +291,11 @@ async def handle_anonymity(callback: types.CallbackQuery, state: FSMContext):
     is_anon = callback.data == "anon_yes"
     await state.update_data(is_anonymous=is_anon)
     
-    text = "🕵️‍♂️ Выбрана анонимная отправка." if is_anon else "👤 Подарок будет отправлен от вашего имени."
+    if is_anon:
+        text = "🕵️‍♂️ Понял, отправим со скрытым именем (анонимно)."
+    else:
+        text = "👤 Понял, получатель увидит, что подарок от вас."
+    
     await callback.message.answer(f"{text}\n\nВведи @username получателя подарков:")
     await state.set_state(DealForm.waiting_recipient)
     await callback.answer()
@@ -357,9 +359,18 @@ async def process_recipient(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{message.from_user.id}"),
          InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
     ])
+    
+    # Уведомление для АДМИНА (тебя)
+    anon_info = ""
+    if deal_type == 'gift':
+        if is_anonymous:
+            anon_info = "\n❗️ При отправке ВКЛЮЧИТЬ 'Скрыть имя'"
+        else:
+            anon_info = f"\n❗️ Отправить БЕЗ скрытия имени (от @{message.from_user.username or message.from_user.id})"
+
     admin_msg = (
         f"🔔 Новая сделка #{deal_id}\n"
-        f"Тип: {type_text}\n"
+        f"Тип: {type_text}{anon_info}\n"
         f"Покупатель: @{message.from_user.username or message.from_user.id}\n"
         f"Звёзд: {stars}{gift_text}\n"
         f"Цена: {price:.2f} грн\n"
@@ -453,9 +464,16 @@ async def process_receipt(message: types.Message, state: FSMContext):
         anon_text = " (Анонимно 🕵️‍♂️)" if deal['is_anonymous'] else ""
         gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
+    admin_instruction = ""
+    if deal['deal_type'] == 'gift':
+        if deal['is_anonymous']:
+            admin_instruction = "\n❗️ При отправке ВКЛЮЧИТЬ 'Скрыть имя'"
+        else:
+            admin_instruction = f"\n❗️ Отправить БЕЗ скрытия имени (от @{deal['buyer_username']})"
+
     await bot.send_photo(ADMIN_ID, photo=file_id,
         caption=f"💰 Чек по сделке #{deal_id}\n"
-                f"Тип: {deal_type_text}{gift_text}\n"
+                f"Тип: {deal_type_text}{gift_text}{admin_instruction}\n"
                 f"Звёзд: {deal['stars_amount']}\n"
                 f"Получатель: @{deal['recipient_username']}\n"
                 f"Сумма: {deal['price_uah']:.2f} грн\n\n"
