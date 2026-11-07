@@ -630,9 +630,9 @@ async def admin_accept(callback: types.CallbackQuery):
         gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
 
     if currency == 'UAH':
-        reqs = f"`{CARD_NUMBER_UAH}`\n{CARD_NAME_UAH}"
+        reqs = f"<code>{CARD_NUMBER_UAH}</code>\n{CARD_NAME_UAH}"
     else:
-        reqs = f"📱 Номер: `{RUB_PHONE}`\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
+        reqs = f"📱 Номер: <code>{RUB_PHONE}</code>\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
 
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
@@ -654,7 +654,7 @@ async def admin_accept(callback: types.CallbackQuery):
         f"Переведи {price_display} {curr_symbol} по реквизитам:\n{reqs}\n"
         f"{warning_text}\n"
         f"После оплаты нажми кнопку и прикрепи скриншот.",
-        reply_markup=buyer_kb, parse_mode="Markdown"
+        reply_markup=buyer_kb, parse_mode="HTML"
     )
     await callback.message.edit_text(callback.message.text + "\n\n✅ Ты принял сделку.")
     await callback.answer()
@@ -712,11 +712,13 @@ async def process_receipt(message: types.Message, state: FSMContext):
     deal = get_deal(deal_id)
     await message.answer(f"✅ Чек по сделке #{deal_id} получен. Жди выдачи звёзд.")
 
+    # ДОБАВЛЯЕМ КНОПКУ ОШИБСЯ БАНКОМ И ДЛЯ ТЕБЯ (ПРОДАВЦА)
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")],
         [InlineKeyboardButton(text="📎 Отправить скриншот покупателю", callback_data=f"sendscreen_{deal_id}")],
         [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{deal['buyer_id']}")],
-        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")]
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")],
+        [InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"admin_wrong_bank_cancel_{deal_id}")]
     ])
     
     currency = deal.get('currency', 'UAH')
@@ -841,6 +843,32 @@ async def wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
             f"Пользователь: @{deal['buyer_username']}", 
             parse_mode="HTML"
         )
+    else:
+        await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_wrong_bank_cancel_"))
+async def admin_wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    deal_id = int(callback.data.split("_")[-1])
+    deal = get_deal(deal_id)
+    
+    if deal and deal['status'] in ('pending', 'accepted', 'paid'):
+        update_deal_status(deal_id, 'cancelled')
+        try:
+            await callback.message.edit_text(callback.message.text + "\n\n⛔️ Вы отменили сделку (Покупатель ошибся банком).")
+        except:
+            await callback.message.answer("Вы отменили сделку (Покупатель ошибся банком).")
+            
+        try:
+            await bot.send_message(
+                deal['buyer_id'],
+                "⛔️ <b>Продавец отменил сделку.</b>\n"
+                "Причина: вы отправили средства на реквизиты другого банка.\n"
+                "⚠️ Помните: средства, отправленные не на тот банк, не возвращаются.",
+                parse_mode="HTML"
+            )
+        except: pass
     else:
         await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
     await callback.answer()
