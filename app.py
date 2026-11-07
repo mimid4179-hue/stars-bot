@@ -594,17 +594,27 @@ async def admin_accept(callback: types.CallbackQuery):
     else:
         reqs = f"📱 Номер: `{RUB_PHONE}`\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
 
+    # ДОБАВЛЯЕМ ВТОРУЮ КНОПКУ ОТМЕНЫ (НЕ ТОТ БАНК)
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
         [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
-        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")]
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")],
+        [InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"wrong_bank_cancel_{deal_id}")]
     ])
     
     price_display = int(deal['price_uah'])
+    
+    # ДОБАВЛЯЕМ ТЕКСТ С ПРЕДУПРЕЖДЕНИЕМ
+    warning_text = (
+        "\n\n⚠️ <b>Внимание!</b> Если вы отправили средства на реквизиты другого банка, "
+        "товар выдан не будет, а средства не возвращаются. Сделка будет отменена."
+    )
+    
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\n"
         f"Тип: {deal_type_text}{gift_text}\n"
-        f"Переведи {price_display} {curr_symbol} по реквизитам:\n{reqs}\n\n"
+        f"Переведи {price_display} {curr_symbol} по реквизитам:\n{reqs}\n"
+        f"{warning_text}\n"
         f"После оплаты нажми кнопку и прикрепи скриншот.",
         reply_markup=buyer_kb, parse_mode="Markdown"
     )
@@ -633,7 +643,6 @@ async def buyer_paid(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Сделка не ждёт оплаты", show_alert=True); return
     await state.update_data(deal_id=deal_id)
     
-    # НОВЫЙ ТЕКСТ ДЛЯ ПОДТВЕРЖДЕНИЯ ОПЛАТЫ
     text = (
         "📎 <b>Пожалуйста, отправьте подтверждение оплаты.</b>\n\n"
         "Желательно в виде <b>PDF-квитанции</b> из банковского приложения, "
@@ -757,9 +766,9 @@ async def admin_complete(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("buyer_cancel_"))
 async def buyer_cancel(callback: types.CallbackQuery, state: FSMContext):
-    deal_id = int(callback.data.split("_")[2])
+    deal_id = int(callback.data.split("_")[-1])
     deal = get_deal(deal_id)
-    if deal and deal['status'] in ('pending', 'accepted'):
+    if deal and deal['status'] in ('pending', 'accepted', 'paid'):
         update_deal_status(deal_id, 'cancelled')
         try:
             await callback.message.edit_text(callback.message.text + "\n\n❌ Вы отменили сделку.", reply_markup=None)
@@ -770,10 +779,41 @@ async def buyer_cancel(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
     await callback.answer()
 
+# НОВЫЙ ОБРАБОТЧИК ДЛЯ ОТМЕНЫ ИЗ-ЗА БАНКА
+@dp.callback_query(F.data.startswith("wrong_bank_cancel_"))
+async def wrong_bank_cancel(callback: types.CallbackQuery, state: FSMContext):
+    deal_id = int(callback.data.split("_")[-1])
+    deal = get_deal(deal_id)
+    
+    if deal and deal['status'] in ('pending', 'accepted', 'paid'):
+        update_deal_status(deal_id, 'cancelled')
+        
+        # Сообщение покупателю
+        cancel_msg = (
+            callback.message.text + 
+            "\n\n⛔️ <b>Вы отменили сделку из-за выбора неверного банка.</b>\n"
+            "Помните: средства, отправленные на реквизиты другого банка, не возвращаются."
+        )
+        try:
+            await callback.message.edit_text(cancel_msg, reply_markup=None, parse_mode="HTML")
+        except:
+            await callback.message.answer("Вы отменили сделку из-за неверного банка. Средства не возвращаются.")
+            
+        # Уведомление тебе (админу)
+        await bot.send_message(
+            ADMIN_ID, 
+            f"⛔️ <b>Покупатель отменил сделку #{deal_id} (Ошибся банком)!</b>\n"
+            f"Пользователь: @{deal['buyer_username']}", 
+            parse_mode="HTML"
+        )
+    else:
+        await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("admin_cancel_"))
 async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
-    deal_id = int(callback.data.split("_")[2])
+    deal_id = int(callback.data.split("_")[-1])
     deal = get_deal(deal_id)
     if deal and deal['status'] in ('pending', 'accepted', 'paid'):
         update_deal_status(deal_id, 'cancelled')
@@ -797,7 +837,7 @@ async def contact_admin(callback: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("contact_"))
 async def contact_buyer(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID: return
-    buyer_id = int(callback.data.split("_")[1])
+    buyer_id = int(callback.data.split("_")[-1])
     await state.update_data(target_id=buyer_id)
     await callback.message.answer("Напишите сообщение для покупателя. Оно будет отправлено ему в чат.")
     await state.set_state(DealForm.chat_admin)
@@ -851,7 +891,7 @@ async def process_report(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("delrev_"))
 async def delete_review(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    review_id = int(callback.data.split("_")[1])
+    review_id = int(callback.data.split("_")[-1])
     cursor.execute("DELETE FROM reviews WHERE id = %s", (review_id,))
     await callback.message.edit_text(callback.message.text + "\n\n🗑 <b>Оценка удалена.</b>", parse_mode="HTML")
     await callback.answer()
@@ -859,7 +899,7 @@ async def delete_review(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("ban_"))
 async def ban_user(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID: return
-    user_id = int(callback.data.split("_")[1])
+    user_id = int(callback.data.split("_")[-1])
     cursor.execute("INSERT INTO banned_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
     await callback.message.edit_text(callback.message.text + "\n\n🚫 <b>Пользователь забанен.</b>", parse_mode="HTML")
     try:
@@ -869,7 +909,7 @@ async def ban_user(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("rate_"))
 async def process_rating(callback: types.CallbackQuery):
-    rating = int(callback.data.split("_")[1])
+    rating = int(callback.data.split("_")[-1])
     user_id = callback.from_user.id
     
     cursor.execute("SELECT * FROM reviews WHERE user_id = %s", (user_id,))
