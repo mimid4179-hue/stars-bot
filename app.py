@@ -631,22 +631,29 @@ async def admin_accept(callback: types.CallbackQuery):
 
     if currency == 'UAH':
         reqs = f"<code>{CARD_NUMBER_UAH}</code>\n{CARD_NAME_UAH}"
+        # Предупреждение только для рубля
+        warning_text = ""
+        buttons = [
+            [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
+            [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")]
+        ]
     else:
         reqs = f"📱 Номер: <code>{RUB_PHONE}</code>\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
+        warning_text = (
+            "\n\n⚠️ <b>Внимание!</b> Если вы отправили средства на реквизиты другого банка, "
+            "товар выдан не будет, а средства не возвращаются. Сделка будет отменена."
+        )
+        buttons = [
+            [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
+            [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
+            [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")],
+            [InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"wrong_bank_cancel_{deal_id}")]
+        ]
 
-    buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
-        [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
-        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")],
-        [InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"wrong_bank_cancel_{deal_id}")]
-    ])
+    buyer_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     
     price_display = int(deal['price_uah'])
-    
-    warning_text = (
-        "\n\n⚠️ <b>Внимание!</b> Если вы отправили средства на реквизиты другого банка, "
-        "товар выдан не будет, а средства не возвращаются. Сделка будет отменена."
-    )
     
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\n"
@@ -712,16 +719,21 @@ async def process_receipt(message: types.Message, state: FSMContext):
     deal = get_deal(deal_id)
     await message.answer(f"✅ Чек по сделке #{deal_id} получен. Жди выдачи звёзд.")
 
-    # ДОБАВЛЯЕМ КНОПКУ ОШИБСЯ БАНКОМ И ДЛЯ ТЕБЯ (ПРОДАВЦА)
-    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+    currency = deal.get('currency', 'UAH')
+    
+    admin_buttons = [
         [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")],
         [InlineKeyboardButton(text="📎 Отправить скриншот покупателю", callback_data=f"sendscreen_{deal_id}")],
         [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{deal['buyer_id']}")],
-        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")],
-        [InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"admin_wrong_bank_cancel_{deal_id}")]
-    ])
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")]
+    ]
     
-    currency = deal.get('currency', 'UAH')
+    # Кнопка для админа тоже только для RUB
+    if currency == 'RUB':
+        admin_buttons.append([InlineKeyboardButton(text="⛔️ Отменить (Ошибся банком)", callback_data=f"admin_wrong_bank_cancel_{deal_id}")])
+        
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=admin_buttons)
+    
     curr_symbol = "грн" if currency == 'UAH' else "руб"
     
     deal_type_text = "🎁 Подарком" if deal['deal_type'] == 'gift' else "⭐ На баланс"
