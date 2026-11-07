@@ -47,7 +47,6 @@ conn = psycopg2.connect(DATABASE_URL)
 conn.autocommit = True
 cursor = conn.cursor(cursor_factory=DictCursor)
 
-# 1. Создаем базовую таблицу, если её нет
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS deals (
     id INTEGER PRIMARY KEY,
@@ -63,8 +62,6 @@ CREATE TABLE IF NOT EXISTS deals (
     awaiting_review INTEGER DEFAULT 0
 )
 """)
-
-# 2. Принудительно добавляем новые колонки, если их нет (чтобы починить старую базу)
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS deal_type TEXT DEFAULT 'balance'")
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS gift_items TEXT")
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
@@ -267,11 +264,10 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(stars=total_stars)
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="👤 Нет, показать мое имя", callback_data="anon_no")],
-            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть мое имя", callback_data="anon_yes")]
+            [InlineKeyboardButton(text="👤 Нет, показать имя отправителя", callback_data="anon_no")],
+            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть имя отправителя", callback_data="anon_yes")]
         ])
-        # ИЗМЕНЕН ТЕКСТ ТУТ
-        await callback.message.answer("Хотите ли вы скрыть ваше имя (отправителя) при отправке подарка?", reply_markup=kb)
+        await callback.message.answer("Хотите ли вы скрыть имя отправителя при отправке подарка?", reply_markup=kb)
         await state.set_state(DealForm.choosing_anonymity)
         await callback.answer()
         return
@@ -380,7 +376,8 @@ async def process_recipient(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"accept_{deal_id}"),
          InlineKeyboardButton(text="❌ Отказаться", callback_data=f"decline_{deal_id}")],
         [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{message.from_user.id}"),
-         InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
+         InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")],
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")]
     ])
     
     anon_info = ""
@@ -423,7 +420,8 @@ async def admin_accept(callback: types.CallbackQuery):
 
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
-        [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")]
+        [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"buyer_cancel_{deal_id}")]
     ])
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\n"
@@ -475,7 +473,8 @@ async def process_receipt(message: types.Message, state: FSMContext):
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Звёзды выданы, завершить", callback_data=f"complete_{deal_id}")],
         [InlineKeyboardButton(text="📎 Отправить скриншот покупателю", callback_data=f"sendscreen_{deal_id}")],
-        [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{deal['buyer_id']}")]
+        [InlineKeyboardButton(text="💬 Связаться с покупателем", callback_data=f"contact_{deal['buyer_id']}")],
+        [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")]
     ])
     
     deal_type_text = "🎁 Подарком" if deal['deal_type'] == 'gift' else "⭐ На баланс"
@@ -551,6 +550,43 @@ async def admin_complete(callback: types.CallbackQuery):
     await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
     await callback.answer()
 
+# --- ОТМЕНА СДЕЛКИ ---
+
+@dp.callback_query(F.data.startswith("buyer_cancel_"))
+async def buyer_cancel(callback: types.CallbackQuery, state: FSMContext):
+    deal_id = int(callback.data.split("_")[2])
+    deal = get_deal(deal_id)
+    if deal and deal['status'] in ('pending', 'accepted'):
+        update_deal_status(deal_id, 'cancelled')
+        try:
+            await callback.message.edit_text(callback.message.text + "\n\n❌ Вы отменили сделку.", reply_markup=None)
+        except:
+            await callback.message.answer("Вы отменили сделку.")
+        await bot.send_message(ADMIN_ID, f"❌ <b>Покупатель отменил сделку #{deal_id}</b>", parse_mode="HTML")
+    else:
+        await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admin_cancel_"))
+async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID: return
+    deal_id = int(callback.data.split("_")[2])
+    deal = get_deal(deal_id)
+    if deal and deal['status'] in ('pending', 'accepted', 'paid'):
+        update_deal_status(deal_id, 'cancelled')
+        try:
+            await callback.message.edit_text(callback.message.text + "\n\n❌ Вы отменили сделку.")
+        except:
+            await callback.message.answer("Вы отменили сделку.")
+        try:
+            await bot.send_message(deal['buyer_id'], f"❌ <b>Продавец отменил сделку #{deal_id}.</b>\nЕсли вы уже оплатили, свяжитесь с продавцом для возврата средств.", parse_mode="HTML")
+        except: pass
+    else:
+        await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
+    await callback.answer()
+
+# --- СВЯЗЬ ---
+
 @dp.callback_query(F.data == "contact_admin")
 async def contact_admin(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Напишите ваше сообщение для продавца. Оно будет доставлено лично в чат.")
@@ -588,6 +624,28 @@ async def process_chat_admin(message: types.Message, state: FSMContext):
             await message.answer("Не удалось отправить сообщение (возможно, пользователь заблокировал бота).")
     await state.clear()
 
+# --- ЖАЛОБЫ И ОТЗЫВЫ ---
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message, state: FSMContext):
+    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
+    await state.set_state(DealForm.waiting_report)
+
+@dp.message(DealForm.waiting_report)
+async def process_report(message: types.Message, state: FSMContext):
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f"contact_{message.from_user.id}")],
+        [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
+    ])
+    try:
+        await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+        await bot.send_message(ADMIN_ID, f"🚨 <b>Жалоба от</b> {user_info}\n\n<i>Чтобы ответить, нажмите кнопку ниже.</i>", reply_markup=admin_kb, parse_mode="HTML")
+    except: pass
+
+    await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
+    await state.clear()
+
 @dp.message(F.text)
 async def handle_text_review(message: types.Message):
     if message.text.startswith('/'): return
@@ -600,13 +658,14 @@ async def handle_text_review(message: types.Message):
         user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
         
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f"contact_{message.from_user.id}")],
             [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
         ])
         try:
             forwarded_msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
             await bot.send_message(
                 ADMIN_ID, 
-                f"📝 <b>Отзыв к сделке #{deal_id}</b>\nОт: {user_info}", 
+                f"📝 <b>Отзыв к сделке #{deal_id}</b>\nОт: {user_info}\n\n<i>Чтобы ответить, нажмите кнопку ниже.</i>", 
                 reply_to_message_id=forwarded_msg.message_id,
                 reply_markup=admin_kb,
                 parse_mode="HTML"
@@ -617,6 +676,86 @@ async def handle_text_review(message: types.Message):
         cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
         await message.answer("Спасибо за ваш отзыв! ❤️")
         return
+
+# --- УДАЛЕНИЕ И БАН ---
+
+@dp.callback_query(F.data.startswith("delrev_"))
+async def delete_review(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    review_id = int(callback.data.split("_")[1])
+    cursor.execute("DELETE FROM reviews WHERE id = %s", (review_id,))
+    await callback.message.edit_text(callback.message.text + "\n\n🗑 <b>Оценка удалена.</b>", parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("ban_"))
+async def ban_user(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID: return
+    user_id = int(callback.data.split("_")[1])
+    cursor.execute("INSERT INTO banned_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING", (user_id,))
+    await callback.message.edit_text(callback.message.text + "\n\n🚫 <b>Пользователь забанен.</b>", parse_mode="HTML")
+    try:
+        await bot.send_message(user_id, "🚫 Вы были заблокированы администратором за нарушение правил.")
+    except: pass
+    await callback.answer()
+
+@dp.message(Command("review"))
+async def cmd_review(message: types.Message):
+    if message.from_user.id == ADMIN_ID: return
+    
+    cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
+    result = cursor.fetchone()
+    count = result['count']
+    avg_rating = round(result['avg'], 1) if result['avg'] else 0.0
+
+    text = f"Пожалуйста, оставьте отзыв о нашей работе в канале!\n\n"
+    text += f"📊 <b>Средняя оценка:</b> {avg_rating} ⭐ (Всего оценок: {count})\n\n"
+    text += f"Выберите оценку ниже:"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="1⭐", callback_data="rate_1"),
+            InlineKeyboardButton(text="2⭐", callback_data="rate_2"),
+            InlineKeyboardButton(text="3⭐", callback_data="rate_3"),
+            InlineKeyboardButton(text="4⭐", callback_data="rate_4"),
+            InlineKeyboardButton(text="5⭐", callback_data="rate_5")
+        ],
+        [InlineKeyboardButton(text="Перейти в канал с отзывами", url=REVIEWS_CHANNEL)]
+    ])
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("rate_"))
+async def process_rating(callback: types.CallbackQuery):
+    rating = int(callback.data.split("_")[1])
+    user_id = callback.from_user.id
+    
+    cursor.execute("SELECT * FROM reviews WHERE user_id = %s", (user_id,))
+    if cursor.fetchone():
+        await callback.answer("Вы уже оставляли оценку!", show_alert=True)
+        return
+
+    cursor.execute("INSERT INTO reviews (user_id, rating) VALUES (%s, %s) RETURNING id", (user_id, rating))
+    review_id = cursor.fetchone()['id']
+    
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except: pass
+
+    await callback.answer("Спасибо за ваш отзыв! ⭐", show_alert=True)
+    
+    user_info = f"@{callback.from_user.username}" if callback.from_user.username else f"ID: {user_id}"
+    admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Удалить оценку", callback_data=f"delrev_{review_id}")],
+        [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{user_id}")]
+    ])
+    try:
+        await bot.send_message(ADMIN_ID, f"⭐ Новая оценка от {user_info}: {rating} звёзд!", reply_markup=admin_kb)
+    except: pass
+
+@dp.callback_query(F.data == "show_reviews")
+async def show_reviews(callback: types.CallbackQuery):
+    if callback.from_user.id == ADMIN_ID: return
+    await cmd_review(callback.message)
+    await callback.answer()
 
 async def handle(request):
     return web.Response(text="Bot is running!")
