@@ -136,6 +136,15 @@ async def close_expired_deal(deal_id: int, buyer_id: int):
             await bot.send_message(ADMIN_ID, f"⏰ Сделка #{deal_id} отменена по таймауту.")
         except: pass
 
+# Клавиатура для отмены/возврата
+def get_nav_kb(back_cb: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb),
+            InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")
+        ]
+    ])
+
 # ==================== КОМАНДЫ (СТРОГО В НАЧАЛЕ) ====================
 
 @dp.message(Command("stats"))
@@ -152,7 +161,6 @@ async def cmd_stats(message: types.Message):
 
 @dp.message(Command("review"))
 async def cmd_review(message: types.Message):
-    # Явно указываем алиасы для колонок, чтобы не было ошибок
     cursor.execute("SELECT COUNT(*) AS cnt, AVG(rating) AS avg_rt FROM reviews")
     result = cursor.fetchone()
     count = result['cnt'] if result['cnt'] else 0
@@ -218,11 +226,20 @@ async def cmd_buy(message: types.Message, state: FSMContext):
 
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message, state: FSMContext):
-    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
+    await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.", reply_markup=get_nav_kb("cancel_deal"))
     await state.set_state(DealForm.waiting_report)
 
 
 # ==================== КОЛБЭКИ И СОСТОЯНИЯ ====================
+
+@dp.callback_query(F.data == "cancel_deal")
+async def cancel_deal_cb(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.edit_text("❌ Сделка отменена. Вы можете начать заново, нажав /start.")
+    except:
+        await callback.message.answer("❌ Сделка отменена. Вы можете начать заново, нажав /start.")
+    await callback.answer()
 
 async def choose_type(message_or_callback, state: FSMContext):
     text = (
@@ -232,7 +249,8 @@ async def choose_type(message_or_callback, state: FSMContext):
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ На баланс", callback_data="type_balance")],
-        [InlineKeyboardButton(text="🎁 Подарком", callback_data="type_gift")]
+        [InlineKeyboardButton(text="🎁 Подарком", callback_data="type_gift")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")]
     ])
     if isinstance(message_or_callback, types.Message):
         await message_or_callback.answer(text, reply_markup=kb, parse_mode="HTML")
@@ -245,10 +263,15 @@ async def cb_choose_type(callback: types.CallbackQuery, state: FSMContext):
     await choose_type(callback, state)
     await callback.answer()
 
+@dp.callback_query(F.data == "back_to_type")
+async def back_to_type(callback: types.CallbackQuery, state: FSMContext):
+    await choose_type(callback, state)
+    await callback.answer()
+
 @dp.callback_query(F.data == "type_balance")
 async def type_balance(callback: types.CallbackQuery, state: FSMContext):
     await state.update_data(deal_type='balance')
-    await callback.message.answer("Введи количество звёзд (минимум 50):")
+    await callback.message.answer("Введи количество звёзд (минимум 50):", reply_markup=get_nav_kb("back_to_type"))
     await state.set_state(DealForm.waiting_stars)
     await callback.answer()
 
@@ -287,6 +310,7 @@ async def show_gift_menu(message: types.Message, state: FSMContext):
     
     buttons.append([InlineKeyboardButton(text="🗑 Очистить выбор", callback_data="gift_clear")])
     buttons.append([InlineKeyboardButton(text="✅ Подтвердить выбор", callback_data="gift_confirm")])
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_type"), InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")])
     
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     
@@ -295,6 +319,11 @@ async def show_gift_menu(message: types.Message, state: FSMContext):
     else:
         await message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await state.set_state(DealForm.choosing_gifts)
+
+@dp.callback_query(F.data == "back_to_gifts")
+async def back_to_gifts(callback: types.CallbackQuery, state: FSMContext):
+    await show_gift_menu(callback.message, state)
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("gift_"))
 async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
@@ -313,7 +342,8 @@ async def handle_gift_choice(callback: types.CallbackQuery, state: FSMContext):
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="👤 Нет, показать имя отправителя", callback_data="anon_no")],
-            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть имя отправителя", callback_data="anon_yes")]
+            [InlineKeyboardButton(text="🕵️‍♂️ Да, скрыть имя отправителя", callback_data="anon_yes")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_gifts"), InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")]
         ])
         await callback.message.answer("Хотите ли вы скрыть имя отправителя при отправке подарка?", reply_markup=kb)
         await state.set_state(DealForm.choosing_anonymity)
@@ -343,8 +373,14 @@ async def handle_anonymity(callback: types.CallbackQuery, state: FSMContext):
     else:
         text = "👤 Понял, получатель увидит, что подарок от вас."
     
-    await callback.message.answer(f"{text}\n\nВведи @username получателя подарков:")
+    await callback.message.answer(f"{text}\n\nВведи @username получателя подарков:", reply_markup=get_nav_kb("back_to_gifts"))
     await state.set_state(DealForm.waiting_recipient)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_stars")
+async def back_to_stars(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи количество звёзд (минимум 50):", reply_markup=get_nav_kb("back_to_type"))
+    await state.set_state(DealForm.waiting_stars)
     await callback.answer()
 
 @dp.message(DealForm.waiting_stars)
@@ -355,13 +391,13 @@ async def process_stars(message: types.Message, state: FSMContext):
     try:
         stars = int(message.text)
         if stars < 50:
-            await message.answer("Минимум 50. Попробуй ещё:")
+            await message.answer("Минимум 50. Попробуй ещё:", reply_markup=get_nav_kb("back_to_type"))
             return
         await state.update_data(stars=stars, is_anonymous=False)
-        await message.answer("Введи свой @username, на который зачислить звёзды:")
+        await message.answer("Введи свой @username, на который зачислить звёзды:", reply_markup=get_nav_kb("back_to_stars"))
         await state.set_state(DealForm.waiting_recipient)
     except ValueError:
-        await message.answer("Введи число:")
+        await message.answer("Введи число (только цифры):", reply_markup=get_nav_kb("back_to_type"))
 
 @dp.message(DealForm.waiting_recipient)
 async def process_recipient(message: types.Message, state: FSMContext):
@@ -506,7 +542,7 @@ async def buyer_paid(callback: types.CallbackQuery, state: FSMContext):
     if not deal or deal['status'] != 'accepted':
         await callback.answer("Сделка не ждёт оплаты", show_alert=True); return
     await state.update_data(deal_id=deal_id)
-    await callback.message.answer("Отправь скриншот или фото чека:")
+    await callback.message.answer("Отправь скриншот или фото чека:", reply_markup=get_nav_kb("cancel_deal"))
     await state.set_state(DealForm.waiting_receipt)
     await callback.answer()
 
