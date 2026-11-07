@@ -550,8 +550,6 @@ async def admin_complete(callback: types.CallbackQuery):
     await callback.message.edit_caption(callback.message.caption + "\n\n✅ Завершено.")
     await callback.answer()
 
-# --- ОТМЕНА СДЕЛКИ ---
-
 @dp.callback_query(F.data.startswith("buyer_cancel_"))
 async def buyer_cancel(callback: types.CallbackQuery, state: FSMContext):
     deal_id = int(callback.data.split("_")[2])
@@ -584,8 +582,6 @@ async def admin_cancel(callback: types.CallbackQuery, state: FSMContext):
     else:
         await callback.answer("Сделку нельзя отменить на этом этапе.", show_alert=True)
     await callback.answer()
-
-# --- СВЯЗЬ ---
 
 @dp.callback_query(F.data == "contact_admin")
 async def contact_admin(callback: types.CallbackQuery, state: FSMContext):
@@ -624,24 +620,32 @@ async def process_chat_admin(message: types.Message, state: FSMContext):
             await message.answer("Не удалось отправить сообщение (возможно, пользователь заблокировал бота).")
     await state.clear()
 
-# --- ЖАЛОБЫ И ОТЗЫВЫ ---
-
 @dp.message(Command("report"))
 async def cmd_report(message: types.Message, state: FSMContext):
     await message.answer("Если что-то сломалось или не пришли звёзды, напишите нам одним сообщением, и мы решим вопрос за 1 час.")
     await state.set_state(DealForm.waiting_report)
 
-@dp.message(DealForm.waiting_report)
+# СРАБАТЫВАЕТ ТОЛЬКО НА ТЕКСТ, КОТОРЫЙ НЕ ЯВЛЯЕТСЯ КОМАНДОЙ
+@dp.message(DealForm.waiting_report, F.text, ~F.text.startswith('/'))
 async def process_report(message: types.Message, state: FSMContext):
     user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
     admin_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💬 Ответить", callback_data=f"contact_{message.from_user.id}")],
         [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
     ])
+    
     try:
-        await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
-        await bot.send_message(ADMIN_ID, f"🚨 <b>Жалоба от</b> {user_info}\n\n<i>Чтобы ответить, нажмите кнопку ниже.</i>", reply_markup=admin_kb, parse_mode="HTML")
-    except: pass
+        # Отправляем тебе текст жалобы красиво отформатированным
+        await bot.send_message(
+            ADMIN_ID, 
+            f"🚨 <b>Новая жалоба!</b>\n\n"
+            f"От: {user_info}\n"
+            f"Текст: <blockquote>{message.text}</blockquote>", 
+            reply_markup=admin_kb, 
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"Error sending report: {e}")
 
     await message.answer("Спасибо за ваше обращение! Мы свяжемся с вами и решим вопрос в течение 1 часа.")
     await state.clear()
@@ -662,22 +666,21 @@ async def handle_text_review(message: types.Message):
             [InlineKeyboardButton(text="🚫 Забанить", callback_data=f"ban_{message.from_user.id}")]
         ])
         try:
-            forwarded_msg = await bot.forward_message(chat_id=ADMIN_ID, from_chat_id=message.chat.id, message_id=message.message_id)
+            # Отправляем текст отзыва красиво отформатированным
             await bot.send_message(
                 ADMIN_ID, 
-                f"📝 <b>Отзыв к сделке #{deal_id}</b>\nОт: {user_info}\n\n<i>Чтобы ответить, нажмите кнопку ниже.</i>", 
-                reply_to_message_id=forwarded_msg.message_id,
+                f"📝 <b>Отзыв к сделке #{deal_id}</b>\n\n"
+                f"От: {user_info}\n"
+                f"Текст: <blockquote>{message.text}</blockquote>", 
                 reply_markup=admin_kb,
                 parse_mode="HTML"
             )
         except Exception as e:
-            print(f"Ошибка пересылки: {e}")
+            print(f"Error sending review: {e}")
 
         cursor.execute("UPDATE deals SET awaiting_review = 0 WHERE id = %s", (deal_id,))
         await message.answer("Спасибо за ваш отзыв! ❤️")
         return
-
-# --- УДАЛЕНИЕ И БАН ---
 
 @dp.callback_query(F.data.startswith("delrev_"))
 async def delete_review(callback: types.CallbackQuery):
@@ -700,8 +703,6 @@ async def ban_user(callback: types.CallbackQuery):
 
 @dp.message(Command("review"))
 async def cmd_review(message: types.Message):
-    if message.from_user.id == ADMIN_ID: return
-    
     cursor.execute("SELECT COUNT(*), AVG(rating) FROM reviews")
     result = cursor.fetchone()
     count = result['count']
@@ -753,7 +754,6 @@ async def process_rating(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "show_reviews")
 async def show_reviews(callback: types.CallbackQuery):
-    if callback.from_user.id == ADMIN_ID: return
     await cmd_review(callback.message)
     await callback.answer()
 
