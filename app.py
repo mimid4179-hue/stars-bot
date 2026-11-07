@@ -16,8 +16,16 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ========== НАСТРОЙКИ ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 0))
-CARD_NUMBER = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
-CARD_NAME = os.environ.get("CARD_NAME", "Имя Фамилия")
+
+# Реквизиты для гривны (UAH)
+CARD_NUMBER_UAH = os.environ.get("CARD_NUMBER", "0000 0000 0000 0000")
+CARD_NAME_UAH = os.environ.get("CARD_NAME", "Имя Фамилия")
+
+# Реквизиты для рубля (RUB)
+RUB_PHONE = os.environ.get("RUB_PHONE", "+7 900 087 3812")
+RUB_NAME = os.environ.get("RUB_NAME", "Алексей М.")
+RUB_BANK = os.environ.get("RUB_BANK", "Альфа Банк")
+
 DEAL_TIMEOUT_MINUTES = 15
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
@@ -65,6 +73,7 @@ CREATE TABLE IF NOT EXISTS deals (
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS deal_type TEXT DEFAULT 'balance'")
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS gift_items TEXT")
 cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS is_anonymous BOOLEAN DEFAULT FALSE")
+cursor.execute("ALTER TABLE deals ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'UAH'")
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS reviews (
@@ -97,6 +106,7 @@ dp.message.middleware(BanMiddleware())
 dp.callback_query.middleware(BanMiddleware())
 
 class DealForm(StatesGroup):
+    choosing_currency = State()
     choosing_type = State()
     choosing_gifts = State()
     choosing_anonymity = State()
@@ -107,12 +117,21 @@ class DealForm(StatesGroup):
     chat_buyer = State()
     chat_admin = State()
 
-def calculate_price(stars: int, deal_type: str = 'balance') -> int:
-    if deal_type == 'gift':
+# ФУНКЦИЯ РАСЧЕТА ЦЕНЫ С ОКРУГЛЕНИЕМ
+def calculate_price(stars: int, deal_type: str = 'balance', currency: str = 'UAH') -> int:
+    if currency == 'UAH':
+        if deal_type == 'gift':
+            return int(stars * 0.75 + 0.5)
+        if stars < 100:
+            return int(stars * 0.8 + 0.5)
         return int(stars * 0.75 + 0.5)
-    if stars < 100:
-        return int(stars * 0.8 + 0.5)
-    return int(stars * 0.75 + 0.5)
+    elif currency == 'RUB':
+        if deal_type == 'gift':
+            return int(stars * 1.5 + 0.5)
+        if stars < 100:
+            return int(stars * 1.55 + 0.5)
+        return int(stars * 1.5 + 0.5)
+    return 0
 
 def get_deal(deal_id: int):
     cursor.execute("SELECT * FROM deals WHERE id = %s", (deal_id,))
@@ -160,16 +179,13 @@ async def cmd_deals(message: types.Message):
     text = "📋 <b>Последние 20 сделок:</b>\n\n"
     for d in deals:
         status_map = {
-            'pending': '⏳ Ожидает',
-            'accepted': '✅ Принята',
-            'paid': '💰 Оплачена',
-            'completed': '🎉 Завершена',
-            'declined': '❌ Отклонена',
-            'cancelled': '🚫 Отменена',
-            'expired': '⌛️ Просрочена'
+            'pending': '⏳ Ожидает', 'accepted': '✅ Принята', 'paid': '💰 Оплачена',
+            'completed': '🎉 Завершена', 'declined': '❌ Отклонена', 'cancelled': '🚫 Отменена', 'expired': '⌛️ Просрочена'
         }
         status = status_map.get(d['status'], d['status'])
-        text += f"#{d['id']} | {d['stars_amount']}⭐ | {int(d['price_uah'])} грн | {status}\n"
+        curr = d.get('currency', 'UAH')
+        curr_symbol = "грн" if curr == 'UAH' else "руб"
+        text += f"#{d['id']} | {d['stars_amount']}⭐ | {int(d['price_uah'])} {curr_symbol} | {status}\n"
         text += f"Покупатель: @{d['buyer_username']} | Получатель: @{d['recipient_username']}\n\n"
         
     await message.answer(text, parse_mode="HTML")
@@ -227,15 +243,18 @@ async def start(message: types.Message, state: FSMContext):
         f"Здравствуйте!\n\n"
         f"Тут вы можете купить моментальные звёзды на баланс либо подарком.\n"
         f"✅ Звёзды приходят моментально, всё абсолютно безопасно.\n\n"
-        f"💵 <b>Курс:</b>\n"
+        f"💵 <b>Курс (UAH):</b>\n"
         f"50-99 звёзд — 0.8 грн\n"
         f"от 100 — 0.75 грн\n\n"
+        f"💵 <b>Курс (RUB):</b>\n"
+        f"50-99 звёзд — 1.55 руб\n"
+        f"от 100 — 1.5 руб\n\n"
         f"👤 Мой профиль: {MY_USERNAME}\n"
         f"🌟 Отзывы: @otzfrosy\n\n"
         f"Если есть дополнительные вопросы, обращайтесь."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="choose_type")],
+        [InlineKeyboardButton(text="⭐ Купить звёзды", callback_data="choose_currency")],
         [InlineKeyboardButton(text="💬 Связаться с продавцом", callback_data="contact_admin")],
         [InlineKeyboardButton(text="📝 Оценить бота", callback_data="show_reviews")]
     ])
@@ -250,7 +269,7 @@ async def cmd_buy(message: types.Message, state: FSMContext):
     if cursor.fetchone():
         await message.answer("У вас уже есть активная сделка. Пожалуйста, дождитесь её завершения.")
         return
-    await choose_type(message, state)
+    await choose_currency(message, state)
 
 @dp.message(Command("chat"))
 async def cmd_chat(message: types.Message, state: FSMContext):
@@ -274,27 +293,59 @@ async def cancel_deal_cb(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("❌ Действие отменено. Вы можете начать заново, нажав /start.")
     await callback.answer()
 
+# 1. ВЫБОР ВАЛЮТЫ
+async def choose_currency(message_or_callback, state: FSMContext):
+    text = "Выберите валюту для оплаты:"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇦 Оплатить в UAH (Гривна)", callback_data="curr_UAH")],
+        [InlineKeyboardButton(text="🇷🇺 Оплатить в RUB (Рубль)", callback_data="curr_RUB")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")]
+    ])
+    if isinstance(message_or_callback, types.Message):
+        await message_or_callback.answer(text, reply_markup=kb)
+    else:
+        await message_or_callback.message.edit_text(text, reply_markup=kb)
+    await state.set_state(DealForm.choosing_currency)
+
+@dp.callback_query(F.data == "choose_currency")
+async def cb_choose_currency(callback: types.CallbackQuery, state: FSMContext):
+    await choose_currency(callback, state)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("curr_"))
+async def handle_currency_choice(callback: types.CallbackQuery, state: FSMContext):
+    currency = callback.data.split("_")[1]
+    await state.update_data(currency=currency)
+    await choose_type(callback, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_currency")
+async def back_to_currency(callback: types.CallbackQuery, state: FSMContext):
+    await choose_currency(callback, state)
+    await callback.answer()
+
+# 2. ВЫБОР ТИПА (БАЛАНС ИЛИ ПОДАРОК)
 async def choose_type(message_or_callback, state: FSMContext):
+    data = await state.get_data()
+    curr = data.get('currency', 'UAH')
+    curr_symbol = "грн" if curr == 'UAH' else "руб"
+    
     text = (
+        f"Валюта: <b>{curr_symbol}</b>\n\n"
         "Выберите способ покупки:\n\n"
         "⭐ <b>На баланс</b> — звёзды будут зачислены на ваш аккаунт.\n"
-        "🎁 <b>Подарком</b> — вы сможете выбрать один или несколько подарков для другого пользователя."
+        "🎁 <b>Подарком</b> — вы сможете выбрать один или несколько подарков."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ На баланс", callback_data="type_balance")],
         [InlineKeyboardButton(text="🎁 Подарком", callback_data="type_gift")],
-        [InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")]
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_currency"), InlineKeyboardButton(text="❌ Отменить", callback_data="cancel_deal")]
     ])
     if isinstance(message_or_callback, types.Message):
         await message_or_callback.answer(text, reply_markup=kb, parse_mode="HTML")
     else:
         await message_or_callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await state.set_state(DealForm.choosing_type)
-
-@dp.callback_query(F.data == "choose_type")
-async def cb_choose_type(callback: types.CallbackQuery, state: FSMContext):
-    await choose_type(callback, state)
-    await callback.answer()
 
 @dp.callback_query(F.data == "back_to_type")
 async def back_to_type(callback: types.CallbackQuery, state: FSMContext):
@@ -317,11 +368,12 @@ async def type_gift(callback: types.CallbackQuery, state: FSMContext):
 async def show_gift_menu(message: types.Message, state: FSMContext):
     data = await state.get_data()
     selected = data.get('selected_gifts', [])
+    curr = data.get('currency', 'UAH')
+    curr_symbol = "грн" if curr == 'UAH' else "руб"
     
     text = (
         "🎁 <b>Покупка подарком</b>\n\n"
-        "Здесь вы можете приобрести звёзды в виде подарков для другого пользователя.\n"
-        "Курс: <b>0.75 грн</b> за звезду.\n\n"
+        f"Валюта: <b>{curr_symbol}</b>\n\n"
         "Выберите подарки (можно несколько):\n"
     )
     
@@ -337,9 +389,9 @@ async def show_gift_menu(message: types.Message, state: FSMContext):
         buttons.append(row)
     
     total_stars = sum(GIFTS[k]['stars'] for k in selected)
-    total_price = calculate_price(total_stars, 'gift') if total_stars > 0 else 0
+    total_price = calculate_price(total_stars, 'gift', curr) if total_stars > 0 else 0
     
-    text += f"\nВыбрано: <b>{total_stars} ⭐</b> на сумму <b>{total_price} грн</b>"
+    text += f"\nВыбрано: <b>{total_stars} ⭐</b> на сумму <b>{total_price} {curr_symbol}</b>"
     
     buttons.append([InlineKeyboardButton(text="🗑 Очистить выбор", callback_data="gift_clear")])
     buttons.append([InlineKeyboardButton(text="✅ Подтвердить выбор", callback_data="gift_confirm")])
@@ -442,6 +494,9 @@ async def process_recipient(message: types.Message, state: FSMContext):
     data = await state.get_data()
     
     stars = data.get('stars')
+    currency = data.get('currency', 'UAH')
+    curr_symbol = "грн" if currency == 'UAH' else "руб"
+    
     if not stars:
         await message.answer("Ошибка: данные о сделке утеряны. Пожалуйста, начните заново, нажав /start.")
         await state.clear()
@@ -453,7 +508,7 @@ async def process_recipient(message: types.Message, state: FSMContext):
     
     gift_items_str = json.dumps(selected_gifts, ensure_ascii=False) if deal_type == 'gift' else None
     
-    price = calculate_price(stars, deal_type)
+    price = calculate_price(stars, deal_type, currency)
     now = datetime.datetime.now()
     expires = now + datetime.timedelta(minutes=DEAL_TIMEOUT_MINUTES)
     
@@ -463,9 +518,9 @@ async def process_recipient(message: types.Message, state: FSMContext):
 
     try:
         cursor.execute("""
-            INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, is_anonymous, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0)
-        """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat()))
+            INSERT INTO deals (id, buyer_id, buyer_username, deal_type, gift_items, is_anonymous, stars_amount, recipient_username, price_uah, status, created_at, expires_at, awaiting_review, currency)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'pending', %s, %s, 0, %s)
+        """, (deal_id, message.from_user.id, message.from_user.username or "нет", deal_type, gift_items_str, is_anonymous, stars, recipient, price, now.isoformat(), expires.isoformat(), currency))
     except Exception as e:
         print(f"DB ERROR: {e}")
         await message.answer("❌ Произошла ошибка при создании сделки.")
@@ -484,7 +539,7 @@ async def process_recipient(message: types.Message, state: FSMContext):
         f"✅ Сделка #{deal_id} создана.\n"
         f"Тип: {type_text}\n"
         f"Звёзд: {stars}{gift_text}\n"
-        f"К оплате: {price} грн\n"
+        f"К оплате: {price} {curr_symbol}\n"
         f"Получатель: @{recipient}\n\n"
         f"Жди подтверждения от админа. Время: {DEAL_TIMEOUT_MINUTES} мин."
     )
@@ -505,11 +560,11 @@ async def process_recipient(message: types.Message, state: FSMContext):
             anon_info = f"\n❗️ Отправить БЕЗ скрытия имени (от @{message.from_user.username or message.from_user.id})"
 
     admin_msg = (
-        f"🔔 Новая сделка #{deal_id}\n"
+        f"🔔 Новая сделка #{deal_id} ({currency})\n"
         f"Тип: {type_text}{anon_info}\n"
         f"Покупатель: @{message.from_user.username or message.from_user.id}\n"
         f"Звёзд: {stars}{gift_text}\n"
-        f"Цена: {price} грн\n"
+        f"Цена: {price} {curr_symbol}\n"
         f"Получатель: @{recipient}"
     )
     await bot.send_message(ADMIN_ID, admin_msg, reply_markup=admin_kb)
@@ -528,6 +583,8 @@ async def admin_accept(callback: types.CallbackQuery):
         await callback.answer("Сделка неактивна", show_alert=True); return
 
     update_deal_status(deal_id, 'accepted')
+    currency = deal.get('currency', 'UAH')
+    curr_symbol = "грн" if currency == 'UAH' else "руб"
     
     deal_type_text = "🎁 Подарком" if deal['deal_type'] == 'gift' else "⭐ На баланс"
     gift_text = ""
@@ -536,6 +593,12 @@ async def admin_accept(callback: types.CallbackQuery):
         gift_names = [GIFTS[k]['name'] for k in selected]
         anon_text = " (Анонимно 🕵️‍♂️)" if deal['is_anonymous'] else ""
         gift_text = f"\nПодарки: {', '.join(gift_names)}{anon_text}"
+
+    # Выбираем реквизиты в зависимости от валюты
+    if currency == 'UAH':
+        reqs = f"`{CARD_NUMBER_UAH}`\n{CARD_NAME_UAH}"
+    else:
+        reqs = f"📱 Номер: `{RUB_PHONE}`\n👤 Получатель: {RUB_NAME}\n🏦 Банк: {RUB_BANK}"
 
     buyer_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📸 Я оплатил, прикрепить чек", callback_data=f"paid_{deal_id}")],
@@ -547,7 +610,7 @@ async def admin_accept(callback: types.CallbackQuery):
     await bot.send_message(deal['buyer_id'],
         f"✅ Сделка #{deal_id} принята!\n"
         f"Тип: {deal_type_text}{gift_text}\n"
-        f"Переведи {price_display} грн на карту:\n`{CARD_NUMBER}`\n{CARD_NAME}\n\n"
+        f"Переведи {price_display} {curr_symbol} по реквизитам:\n{reqs}\n\n"
         f"После оплаты нажми кнопку и прикрепи скриншот.",
         reply_markup=buyer_kb, parse_mode="Markdown"
     )
@@ -598,6 +661,9 @@ async def process_receipt(message: types.Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отменить сделку", callback_data=f"admin_cancel_{deal_id}")]
     ])
     
+    currency = deal.get('currency', 'UAH')
+    curr_symbol = "грн" if currency == 'UAH' else "руб"
+    
     deal_type_text = "🎁 Подарком" if deal['deal_type'] == 'gift' else "⭐ На баланс"
     gift_text = ""
     if deal['deal_type'] == 'gift' and deal['gift_items']:
@@ -616,11 +682,11 @@ async def process_receipt(message: types.Message, state: FSMContext):
     price_display = int(deal['price_uah'])
 
     await bot.send_photo(ADMIN_ID, photo=file_id,
-        caption=f"💰 Чек по сделке #{deal_id}\n"
+        caption=f"💰 Чек по сделке #{deal_id} ({currency})\n"
                 f"Тип: {deal_type_text}{gift_text}{admin_instruction}\n"
                 f"Звёзд: {deal['stars_amount']}\n"
                 f"Получатель: @{deal['recipient_username']}\n"
-                f"Сумма: {price_display} грн\n\n"
+                f"Сумма: {price_display} {curr_symbol}\n\n"
                 f"Проверь оплату и отправь звёзды через Fragment.",
         reply_markup=admin_kb
     )
